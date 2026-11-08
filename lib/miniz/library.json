@@ -1,0 +1,11 @@
+{
+  "name": "miniz",
+  "version": "3.0.2",
+  "description": "miniz single-file zip/inflate (reconstruction uses read-only APIs)",
+  "build": {
+    "flags": [
+      "-DMINIZ_NO_DEFLATE_APIS",
+      "-DMINIZ_NO_ARCHIVE_WRITING_APIS"
+    ]
+  }
+}
