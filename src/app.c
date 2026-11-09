@@ -964,7 +964,12 @@ static void poweroff_now(void)
     brd_imu_power(false);
     boot_screen_draw();
     brd_delay(250);
-    brd_poweroff();
+    if (brd_charging()) {
+        /* The PMS latch cannot always be cut while USB is present. */
+        brd_deep_sleep(BRD_SLEEP_NO_TIMER, false);
+    } else {
+        brd_poweroff();
+    }
 }
 
 // ---------------------------------------------------------------- library menu
@@ -2315,10 +2320,15 @@ int app_loop(void)
         }
     }
     if ((uint32_t)(now - last_bat) > 30000) {
-        int mv = brd_battery_mv();
-        if (mv > 0) batt_sample_ex(mv, brd_charging(), brd_chg_stat_high(), (int)(brd_temp() * 10.0f));
-        last_bat = now;
-        if (batt_is_low() && !brd_charging()) poweroff_now();
+        bool quiet = !brd_display_busy() && (uint32_t)(now - brd_last_refresh_ms()) > 2000u;
+        if (quiet) {
+            int mv = brd_battery_mv();
+            if (mv > 0) batt_sample_ex(mv, brd_charging(), brd_chg_stat_high(), (int)(brd_temp() * 10.0f));
+            last_bat = now;
+            if (batt_is_low() && !brd_charging()) poweroff_now();
+        } else {
+            last_bat = now - 29000;   /* retry soon, after the panel is quiet */
+        }
     }
     if (g_cfg.auto_off_min > 0 && (uint32_t)(now - g_last_input) > (uint32_t)g_cfg.auto_off_min * 60000u) {
         poweroff_now();
