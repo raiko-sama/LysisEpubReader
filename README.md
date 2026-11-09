@@ -1,114 +1,144 @@
 # Lysis Epub Reader
 
-**Firmware V1.0 Beta per M5Stack Paper S3** — un lettore EPUB offline, essenziale e pensato per lo schermo e-ink.
+**Firmware V1.01 Beta for the M5Stack Paper S3** — an offline EPUB reader built around an e-ink display, local storage and a low-power embedded workflow.
 
 <p align="center">
-  <img src="assets/boot-screen-small.png" width="270" alt="Schermata di avvio del Lysis Epub Reader">
+  <img src="assets/boot-screen-small.png" width="270" alt="Lysis Epub Reader boot screen">
 </p>
 
-<p align="center">
-  <a href="assets/boot-screen-medium.png">Boot screen — formato medio</a>
-</p>
+## Overview
 
-## Panoramica
+Lysis Epub Reader turns the M5Stack Paper S3 into a self-contained EPUB reader. The firmware manages a local library on microSD, paginates EPUB chapters, remembers the reading position, searches text locally and keeps the interface responsive on an e-ink panel.
 
-Lysis Epub Reader è un firmware autonomo per **M5Stack Paper S3** dedicato alla lettura di libri in formato EPUB. L'interfaccia è costruita per l'e-ink: testi grandi, refresh parziali, navigazione a gesti e menu contestuali, senza dipendenze da servizi online.
+The project is intentionally offline-first. WiFi is used only for optional NTP time synchronization. Books, reading state, bookmarks and battery history stay on the device.
 
-Il progetto include il lettore EPUB, l'impaginazione, la gestione della libreria su microSD, la ricerca nel testo, le impostazioni, l'orologio, la sveglia, il collegamento WiFi per la sincronizzazione NTP, la modalità USB Disk e la gestione della batteria.
+## Features
 
-## Funzionalità
+### Library and reading
 
-- **Libreria locale** — scansione di `/sd/books`, ordinamento e copertine/titoli.
-- **Lettore EPUB** — capitoli, pagine, segnalibri e avanzamento persistente.
-- **Ricerca nel testo** — ricerca a parola intera, risultati con anteprima, salto alla pagina trovata e ritorno alla pagina di partenza.
-- **Tipografia** — sei livelli di lettura: 80%, 100%, 120%, 140%, 160%, 200%; interlinea e margini regolabili.
-- **Immagini** — copertine e immagini interne JPEG/PNG scalate nel rispetto delle proporzioni, con supporto ai riferimenti immagine SVG.
-- **Interfaccia e-ink** — refresh parziale durante la lettura, full refresh alla prima apertura, cambio font e antighosting periodico.
-- **Menu e navigazione** — gesti touch, Go To pagina, capitoli, segnalibri e ritorno alla libreria.
-- **Orologio e sveglia** — sincronizzazione NTP opzionale via WiFi e sveglia locale.
-- **USB Disk Mode** — accesso alla microSD dal computer per copiare libri.
-- **Risparmio energetico** — CPU a 240 MHz durante apertura/caricamento e 80 MHz come baseline; deep sleep con schermata di avvio dedicata.
-- **Batteria** — apprendimento degli estremi di carica, rilevamento carica completa e cutoff di sicurezza.
+- Scans EPUB files from `/sd/books`.
+- Persistent library index and title cache.
+- Paginated EPUB chapters with configurable typography.
+- Six reading sizes: **80%, 100%, 120%, 140%, 160% and 200%**.
+- Adjustable line spacing and side margins.
+- Page navigation by touch, chapter list, bookmarks and Go To page.
+- Reading position, bookmarks and layout state persist across restarts.
+- Cover image and internal JPEG/PNG images with aspect-ratio scaling.
+- Image references inside SVG documents are supported.
 
-## Ottimizzazioni
+### Search
 
-Il firmware è stato rifinito per ridurre lavoro inutile senza cambiare l'interfaccia:
+- Whole-word search, so a query does not match inside compound words.
+- Result list with chapter and text preview.
+- Opening a result jumps to the matching page.
+- **Back** returns to the page where the search was started.
+- Chapter text cache for repeated searches.
 
-- ricerca binaria degli offset di pagina;
-- cache delle metriche e delle larghezze del testo;
-- cache ZIP/manifest/titoli e cache testuale della ricerca;
-- tokenizer HTML con confronto tag compatto;
-- `brd_text_fit` con ricerca binaria del punto di troncamento;
-- conversione EPUB→testo con meno copie e lookup indicizzati;
-- conteggio pagine limitato ai capitoli reali;
-- scrittura atomica dello stato e cache immagini gestita alla chiusura del libro;
-- CPU 240 MHz solo nei percorsi di apertura/caricamento, ritorno a 80 MHz nella lettura normale.
+### Interface
 
-## Hardware e requisiti
+- E-ink-focused UI with large touch targets and high-contrast text.
+- Partial refresh during normal reading.
+- Full refresh on first open, after a font change and during periodic anti-ghosting.
+- Status bar with battery level, page position and bookmark state.
+- Settings for dark mode, images, display mode, rotation, auto power-off, NTP clock and alarm.
 
-- **M5Stack Paper S3**
-- microSD formattata FAT32 con cartella `books/`
-- cavo USB dati
-- PlatformIO Core oppure VS Code + estensione PlatformIO
+### Power and battery
 
-## Struttura della repository
+- 3.7 V / 1800 mAh single-cell LiPo with LGS4056H charger.
+- Learned charge/discharge endpoints.
+- LiPo open-circuit-voltage curve for a realistic percentage slope.
+- **Monotonic discharge percentage**: while the device is discharging, voltage recovery cannot make the displayed percentage increase.
+- Charging/full hysteresis, low-battery cutoff and safety shutdown.
+- Battery history written to `/sd/books/.state/_bat_history.csv`.
+- Persistent model and last accepted percentage in `_bat_cycle.dat`.
+- Power-off turns off the display, speaker, IMU, WiFi, SD and SPI peripherals. The battery-backed BM8563 RTC keeps time; the physical power button is the only wake source.
+
+### Connectivity and utilities
+
+- USB Disk Mode to access the microSD from a computer.
+- Optional WiFi NTP synchronization.
+- Local clock and alarm.
+- Deep-sleep boot screen.
+
+## Optimizations
+
+- Binary search for page offsets.
+- Cached font metrics and text widths.
+- Cached chapter text for search.
+- Indexed ZIP, manifest and title lookups.
+- Single-pass HTML tag matching.
+- Binary search in text truncation.
+- Direct ZIP extraction without an intermediate copy.
+- Page count limited to the actual chapter count.
+- Atomic state writes and bounded image/text caches.
+- 240 MHz during book/chapter loading; 80 MHz baseline while reading.
+
+## Hardware
+
+| Item | Value |
+|---|---|
+| MCU | ESP32-S3R8, dual-core Xtensa LX7, 240 MHz |
+| Memory | 8 MB PSRAM, 16 MB flash |
+| Display | 4.7-inch e-ink, 960 × 540 |
+| Touch | GT911 capacitive |
+| Storage | microSD, FAT32 |
+| RTC | BM8563 |
+| IMU | BMI270 |
+| Battery | 3.7 V, 1800 mAh LiPo |
+| Charger | LGS4056H |
+| Power path | PMS150G latch |
+| Power button | short press on, double press off |
+
+## Repository layout
 
 ```
 .
-├── src/                    # firmware, UI, EPUB, paginazione, HAL
-├── lib/                    # miniz, tinyxml2
-├── boards/                 # definizione board PlatformIO
-├── tools/merge_firmware.py # immagine merged per flash completo
-├── assets/                 # immagini per README e manuale
-├── firmware/               # binario merged pronto per il flash
+├── src/
+│   ├── app.c              application, UI, reader and search
+│   ├── bridge.cpp         M5Unified/M5GFX hardware bridge
+│   ├── epub.cpp           EPUB/OPF/NCX and ZIP access
+│   ├── htmltext.c         HTML to text conversion
+│   ├── paginate.c         word wrapping and page layout
+│   ├── battery.c          battery curve and history
+│   ├── state.c            settings and reading state
+│   └── ...
+├── lib/                   miniz and tinyxml2
+├── boards/                PlatformIO board definition
+├── tools/merge_firmware.py
+├── assets/                boot screen images
+├── firmware/              prebuilt merged firmware
 ├── platformio.ini
 ├── partitions.csv
-├── README.md
-└── MANUAL.md               # guida completa build, flash e primo avvio
+├── MANUAL.md
+└── CHANGELOG.md
 ```
 
-## Build rapida
+## Build and flash
 
 ```bash
-git clone <url-della-repository> LysisEpubReader
+git clone https://github.com/raiko-sama/LysisEpubReader.git
 cd LysisEpubReader
 pio run -e m5stack-papers3
-```
-
-Il binario applicativo viene creato in `.pio/build/m5stack-papers3/firmware.bin`. L'immagine merged da 8 MB viene creata nella radice del progetto.
-
-## Flash rapido
-
-Con la board collegata e la porta corretta:
-
-```bash
 pio run -e m5stack-papers3 -t upload --upload-port COM3
 ```
 
-In alternativa, usando l'immagine merged inclusa:
+The complete step-by-step guide, including prerequisites, microSD preparation, USB Disk Mode, battery history and troubleshooting, is in **[MANUAL.md](MANUAL.md)**.
 
-```bash
-esptool.py --chip esp32s3 -p COM3 -b 921600 write_flash 0x0 firmware/lysis-reader-m5stack-papers3.bin
+## SD card layout
+
+```text
+/
+└── books/
+    ├── book-one.epub
+    └── book-two.epub
 ```
 
-> La porta può essere `COM3`, `/dev/ttyACM0`, `/dev/cu.usbmodem...` o un'altra porta assegnata dal sistema. Su Windows verificarla in Gestione dispositivi.
+The `.state/` directory is created automatically. Do not remove it while the device is running.
 
-## Primo avvio
+## Version
 
-1. Copia i file `.epub` nella cartella `books/` della microSD.
-2. Inserisci la microSD nel Paper S3.
-3. Accendi la board e attendi la schermata di avvio.
-4. Dalla libreria tocca un libro per aprirlo.
-5. Tocca il bordo sinistro/destro per cambiare pagina; scorri verso l'alto per il menu e verso il basso per tornare alla libreria.
+**V1.01 Beta** — 2026-11-08
 
-## Manuale completo
+## License
 
-La guida passo passo per installazione, compilazione, flashing, preparazione della microSD, primo avvio e risoluzione dei problemi è in **[MANUAL.md](MANUAL.md)**.
-
-## Versione
-
-**V1.0 Beta** — firmware e documentazione allineati alla build corrente.
-
-## Licenza
-
-Vedi [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE).

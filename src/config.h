@@ -2,7 +2,7 @@
 #pragma once
 
 #define APP_NAME     "Lysis Epub reader"
-#define APP_VERSION  "V1.0 Beta"
+#define APP_VERSION  "V1.01 Beta"
 #define APP_AUTHOR   "Lysis"
 
 #ifndef BOOKS_DIR
@@ -14,6 +14,7 @@
 
 #define ST_BAT_CYCLE        ST_DIR "/_bat_cycle.dat"
 #define ST_BAT_LOG          ST_DIR "/_bat_log.bin"
+#define ST_BAT_HISTORY      ST_DIR "/_bat_history.csv"
 #define ST_BOOKMARKS        ST_DIR "/_bookmarks.dat"
 #define ST_LAST             ST_DIR "/_last.txt"
 #define ST_DISPLAY          ST_DIR "/_display.dat"

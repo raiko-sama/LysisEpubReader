@@ -958,6 +958,10 @@ static void poweroff_now(void)
     reader_state_flush();
     batt_flush();
     st_save_cfg();
+    brd_rtc_sync();
+    brd_wifi_off();
+    brd_bt_off();
+    brd_imu_power(false);
     boot_screen_draw();
     brd_delay(250);
     brd_poweroff();

@@ -1100,10 +1100,19 @@ extern "C" void brd_poweroff(void)
     brd_log("poweroff requested (QEMU: deep sleep forever)");
     esp_deep_sleep_start();
 #else
+    /* Idle every peripheral before the PMS cuts the main rail. The BM8563
+       RTC is battery-backed and remains the only clock domain alive; the
+       physical power button is the only way back on. */
     M5.Display.sleep();
     M5.Speaker.stop();
+    if (M5.Imu.isEnabled()) M5.Imu.sleep();
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_OFF);
+    SD.end();
+    SPI.end();
+    esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
     M5.Power.powerOff();            // cuts the power latch (Paper S3: pulse on GPIO44)
-    esp_deep_sleep_start();         // fallback
+    esp_deep_sleep_start();         // no timer, no GPIO wake: power-button fallback
 #endif
 }
 

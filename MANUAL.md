@@ -1,198 +1,216 @@
-# Manuale di build e flashing
+# Build and Flash Manual
 
-Guida operativa per **Lysis Epub Reader V1.0 Beta** su M5Stack Paper S3.
+Step-by-step guide for **Lysis Epub Reader V1.01 Beta** on the M5Stack Paper S3.
 
-## 1. Prerequisiti
+## 1. Requirements
 
-- **M5Stack Paper S3**
-- Cavo USB **dati** (non solo alimentazione)
-- microSD formattata **FAT32**
-- Python 3.10 o successivo
-- PlatformIO Core **oppure** VS Code con estensione PlatformIO
-- `esptool.py` incluso nell'ambiente PlatformIO; in alternativa installabile con `pip install esptool`
+- M5Stack Paper S3
+- USB **data** cable
+- microSD card formatted **FAT32**
+- Python 3.10 or newer
+- PlatformIO Core, or VS Code with the PlatformIO extension
+- `esptool.py` from the PlatformIO environment, or `pip install esptool`
 
-Verifica gli strumenti:
+Check the tools:
 
 ```bash
 python --version
 pio --version
 ```
 
-## 2. Ottenere il codice
+## 2. Get the source
 
 ```bash
-git clone <url-della-repository> LysisEpubReader
+git clone https://github.com/raiko-sama/LysisEpubReader.git
 cd LysisEpubReader
 ```
 
-La repository è già completa: `src/`, `lib/`, `boards/`, `tools/`, `platformio.ini` e `partitions.csv`.
+## 3. Prepare the microSD card
 
-## 3. Preparare la microSD
-
-1. Formatta la microSD in **FAT32**.
-2. Crea la cartella `books/` nella radice.
-3. Copia dentro i file `.epub`.
-4. Espelli la microSD in modo sicuro e inseriscila nel Paper S3.
-
-Struttura consigliata:
+1. Format the card as FAT32.
+2. Create a `books/` directory in the root.
+3. Copy `.epub` files into `books/`.
+4. Safely eject the card and insert it into the Paper S3.
 
 ```text
 /
 └── books/
-    ├── libro-1.epub
-    ├── libro-2.epub
-    └── ...
+    ├── book-one.epub
+    └── book-two.epub
 ```
 
-La cartella `.state/` viene creata automaticamente dal firmware per stato, segnalibri e impostazioni.
+The firmware creates `.state/` automatically for settings, reading state, bookmarks and battery history.
 
-## 4. Compilare il firmware
+## 4. Build the firmware
 
-Dalla radice della repository:
+From the repository root:
 
 ```bash
 pio run -e m5stack-papers3
 ```
 
-Output principali:
+Main outputs:
 
-- `.pio/build/m5stack-papers3/firmware.bin` — applicazione
-- `lysis-reader-m5stack-papers3.bin` — immagine merged da 8 MB, pronta per il flash completo
+- `.pio/build/m5stack-papers3/firmware.bin` — application image
+- `lysis-reader-m5stack-papers3.bin` — merged 8 MB image for a complete flash
 
-Se vuoi pulire la build:
+Clean build:
 
 ```bash
 pio run -e m5stack-papers3 -t clean
 pio run -e m5stack-papers3
 ```
 
-## 5. Collegare la board
+## 5. Connect the board
 
-1. Collega il Paper S3 al computer con il cavo USB dati.
-2. Apri il gestore porte:
-   - Windows: Gestione dispositivi → Porte (COM e LPT)
-   - Linux: `ls /dev/ttyACM*` oppure `ls /dev/ttyUSB*`
+1. Connect the Paper S3 with a USB data cable.
+2. Find the serial port:
+   - Windows: Device Manager → Ports (COM & LPT)
+   - Linux: `ls /dev/ttyACM*` or `ls /dev/ttyUSB*`
    - macOS: `ls /dev/cu.usbmodem*`
-3. Annota la porta assegnata.
+3. Note the port name.
 
-Esempio Windows: `COM3`.
+## 6. Flash with PlatformIO
 
-## 6. Flash con PlatformIO
-
-Sostituisci `COM3` con la tua porta:
+Replace `COM3` with your port:
 
 ```bash
 pio run -e m5stack-papers3 -t upload --upload-port COM3
 ```
 
-Il comando compila e scrive il firmware. Attendi il messaggio di successo e il riavvio della board.
+Wait for the success message and the automatic restart.
 
-Se la porta è occupata:
+If the port is busy, close any serial monitor:
 
 ```bash
 pio device monitor --port COM3
 ```
 
-Chiudi il monitor con `Ctrl+C` e ripeti l'upload.
+Press `Ctrl+C`, then retry the upload.
 
-## 7. Flash dell'immagine merged
+## 7. Flash the merged image
 
-L'immagine merged contiene bootloader, tabella partizioni e applicazione:
+The merged image contains the bootloader, partition table and application:
 
 ```bash
 esptool.py --chip esp32s3 -p COM3 -b 921600 write_flash 0x0 firmware/lysis-reader-m5stack-papers3.bin
 ```
 
-> Il comando cancella l'intero contenuto della memoria flash del microcontrollore. Non è necessario per i normali aggiornamenti via PlatformIO, ma è utile per un ripristino completo.
+Use this for a complete recovery or a first installation from a blank device. It replaces the full flash content.
 
-## 8. Primo avvio
+## 8. First boot
 
-All'accensione appare la schermata di avvio. Dopo pochi secondi si apre la libreria.
+The device shows the boot screen and then opens the library.
 
-- Tocca un libro per aprirlo.
-- Tocca il lato sinistro o destro della pagina per cambiare pagina.
-- Scorri verso l'alto nella lettura per aprire il menu.
-- Scorri verso il basso per tornare alla libreria.
-- Tocca la barra superiore per capitoli, Go To pagina o segnalibro.
+- Tap a book to open it.
+- Tap the left or right page edge to turn pages.
+- Swipe up while reading to open the menu.
+- Swipe down to return to the library.
+- Tap the status bar for chapter/bookmark controls or Go To page.
 
-## 9. Modalità USB Disk
+## 9. Reading and search
 
-1. Dalla libreria scorri verso l'alto per aprire il menu.
-2. Seleziona **USB disk**.
-3. Tocca lo schermo per avviare la modalità disco.
-4. Copia i libri nella microSD dal computer.
-5. Espelli il volume in modo sicuro.
-6. Tocca lo schermo per uscire e riavviare la board.
+The reader stores the current chapter, page, bookmarks and layout settings.
 
-Non scollegare il cavo durante la scrittura dei file.
+Search is **whole-word**:
 
-## 10. Ricerca e navigazione
+- searching `cerca` does not match `ricerca` or `cercasi`;
+- matching text is opened directly from the result list;
+- **Back** returns to the page where the search was started.
 
-- La ricerca usa parole intere: la parola cercata non viene trovata dentro parole composte.
-- Dai risultati puoi aprire la pagina trovata oppure tornare alla pagina da cui hai iniziato la ricerca con **Back**.
-- **Go To pagina** permette di saltare a una pagina del libro.
-- **Chapters** apre l'elenco dei capitoli e dei segnalibri.
+Search uses a bounded chapter-text cache, so repeating the same search is faster.
 
-## 11. Aggiornamento del firmware
+## 10. Battery behavior
 
-Per aggiornare:
+The firmware estimates the remaining charge from a LiPo open-circuit-voltage curve and learned charge/discharge endpoints.
+
+- While discharging, the displayed percentage is monotonic: it cannot increase because of voltage recovery after load removal.
+- Charging and full-charge states use hysteresis.
+- The last accepted percentage is persisted in `.state/_bat_cycle.dat`.
+- Readings are appended to `.state/_bat_history.csv` for inspection and future model tuning.
+- At the configured low-voltage cutoff the device performs a safe shutdown.
+
+The battery is a 3.7 V / 1800 mAh single-cell LiPo charged by an LGS4056H.
+
+## 11. Power-off behavior
+
+When powered off:
+
+- the display, speaker, IMU, WiFi, SD and SPI peripherals are stopped;
+- the battery-backed BM8563 RTC keeps the clock running;
+- the physical power button is the only way to turn the device back on.
+
+No timer wake-up is enabled for the power-off fallback path.
+
+## 12. USB Disk Mode
+
+1. From the library, swipe up to open the menu.
+2. Select **USB disk**.
+3. Tap the screen to start the mode.
+4. Copy books to the microSD from the computer.
+5. Safely eject the volume.
+6. Tap the screen to leave and reboot.
+
+Do not unplug the cable while files are being written.
+
+## 13. Updating
 
 ```bash
 git pull
 pio run -e m5stack-papers3 -t upload --upload-port COM3
 ```
 
-Per un ripristino completo, usa l'immagine merged aggiornata con il comando del paragrafo 7.
+For a full recovery, flash the updated merged image as described in section 7.
 
-## 12. Risoluzione dei problemi
+## 14. Troubleshooting
 
-### La porta non compare
+### Serial port not found
 
-- Verifica che il cavo sia dati.
-- Prova un'altra porta USB.
-- Installa i driver USB seriali richiesti dal sistema.
-- Su Windows controlla Gestione dispositivi.
+- Use a data cable, not a charge-only cable.
+- Try another USB port.
+- Install the required USB serial driver.
+- On Windows, check Device Manager.
 
-### Upload fallito o porta occupata
+### Upload fails or port is busy
 
 ```bash
 pio device list
 ```
 
-Chiudi monitor seriali, IDE o programmi che usano la porta e riprova.
+Close serial monitors, IDEs or other applications using the port, then retry.
 
-### La microSD non viene letta
+### microSD not detected
 
-- Verifica FAT32.
-- Rimuovi e reinserisci la card.
-- Prova una card più piccola o di marca nota.
-- Ricrea la cartella `books/`.
+- Confirm FAT32 formatting.
+- Reinsert the card.
+- Try a different card.
+- Recreate the `books/` directory.
 
-### La board si riavvia o non mostra la libreria
+### Reader restarts or library does not appear
 
-- Controlla che il file EPUB non sia corrotto.
-- Prova un libro diverso.
-- Rifai il flash merged completo.
+- Test with another EPUB file.
+- Check that the book is not corrupted.
+- Reflash the merged image.
 
-### Compilazione fallita
+### Build fails
 
 ```bash
 pio run -e m5stack-papers3 -t clean
 pio run -e m5stack-papers3
 ```
 
-Controlla di avere una connessione disponibile per scaricare le dipendenze PlatformIO.
+Check that PlatformIO can download its dependencies.
 
-### Immagini non visualizzate
+### Some images are not displayed
 
-Il firmware supporta JPEG e PNG. Alcuni formati (per esempio GIF animati) possono non essere decodificati: è una limitazione del decoder, non un errore della libreria.
+JPEG and PNG are supported. Some formats, such as animated GIF, may not be decoded. This is a decoder limitation, not a library error.
 
-## 13. Note di sicurezza
+## 15. Safety
 
-- Non estrarre la microSD durante scritture o aggiornamenti.
-- Non interrompere il flash merged.
-- Usa solo firmware e librerie provenienti da questa repository.
+- Do not remove the microSD during writes or updates.
+- Do not interrupt a merged-image flash.
+- Use firmware and libraries from this repository.
 
-## 14. Licenza
+## 16. License
 
-Vedi [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE).
