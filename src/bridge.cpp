@@ -135,6 +135,11 @@ extern "C" void brd_begin(bool minimal)
 #endif
     }
     M5.begin(cfg);
+    /* M5GFX runs the EPD update task on core 0 at priority 2: a long panel
+       refresh legitimately starves IDLE0 for seconds, so the core-0 task
+       watchdog must not abort the firmware mid-refresh. Core 1 (UI) stays
+       protected. */
+    disableCore0WDT();
     M5.Display.setRotation(0);
     recreate_canvas();
     M5.Display.setEpdMode(epd_mode_t::epd_quality);

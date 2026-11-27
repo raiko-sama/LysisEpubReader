@@ -55,6 +55,15 @@ Performance batch from the static analysis, with no UI or behaviour change.
   extract images from the ZIP directly into PSRAM.
 - WiFi fast reconnect using cached BSSID/channel with scan fallback.
 - Batched ASCII text drawing and O(log n) accent lookup.
+
+### Stability
+
+- Reader page refresh: one full-screen text update per page instead of two
+  region refreshes (header + body). Fixes a task-watchdog reboot during
+  continuous page loading; page-turn UI time is 234–470 ms with the panel
+  updating asynchronously. The core-0 idle task watchdog is disabled
+  because the M5GFX EPD task legitimately owns that core during refresh;
+  core 1 (UI) stays protected.
 - 2-way hashed text-width cache, `bsearch` block-tag table, 2048-entry
   pagination width cache, non-blocking `brd_log` with a synchronous
   variant for protocol responses.
@@ -68,7 +77,7 @@ Performance batch from the static analysis, with no UI or behaviour change.
 | Scenario | V1.0.2 |
 |---|---|
 | Open book | 0.80–0.87 s |
-| Page turn | 1.11–1.42 s (median ~1.23–1.24 s) |
+| Page turn | **234–470 ms UI**, panel refresh ~1.2 s asynchronous |
 | Menu open | 193 ms |
 | Library page scroll | 627 ms median |
 | Whole-book search | 1.43 s (−22% vs 80 MHz A/B) |

@@ -82,7 +82,7 @@ Values measured on the M5Stack Paper S3 with the reference EPUB library, using t
 | Scenario | V1.0.2 result |
 |---|---|
 | Open book | **0.80–0.87 s** (no eager neighbour preload) |
-| Page turn | **1.11–1.42 s**, median ~1.23–1.24 s (e-paper push dominates) |
+| Page turn | **234–470 ms UI** (panel refresh ~1.2 s asynchronous) |
 | Menu open | **193 ms** |
 | Library page scroll | **627 ms** median (was ~3.3 s with full quality refresh) |
 | Whole-book search | **1.43 s** at 240 MHz; A/B **1.83 s → 1.43 s (−22%)** |

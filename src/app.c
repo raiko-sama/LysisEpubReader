@@ -1355,8 +1355,12 @@ static void reader_draw(void)
         g_reader_full = false;
         g_partial_count = 0;
     } else if (mode == 1) {
-        brd_refresh_region(0, 0, W, 30, 1);
-        brd_refresh_region(0, 30, W, H - 30, 1);
+        /* One full text refresh per page. The M5GFX EPD task pushes every
+           panel scanline anyway, so splitting header/body into two region
+           updates doubled the panel work per page and could starve the
+           core-0 idle task past the 5 s task watchdog. Same pixels, one
+           refresh. */
+        brd_refresh(1);
         g_partial_count++;
     } else {
         brd_refresh(mode);
