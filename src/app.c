@@ -19,6 +19,15 @@
 #include "battery.h"
 #include "boot_image.h"
 
+/* Chatty bring-up traces: compiled out of release builds (DIAG_LOG=0).
+   Protocol responses on the serial CLI (@PERF, @STATE, @BATT, ...) keep
+   using brd_log() and stay available in every build. */
+#if DIAG_LOG
+#define APP_LOGD(s) brd_log(s)
+#else
+#define APP_LOGD(s) ((void)0)
+#endif
+
 // ---------------------------------------------------------------- screens
 typedef enum {
     SCR_LIBRARY = 0, SCR_LIBMENU, SCR_READER, SCR_MENU, SCR_CHAPTERS,
@@ -33,6 +42,7 @@ static bool   g_font_preview;
 static uint32_t g_libmenu_guard;
 
 const char* app_screen_name(void);
+bool app_can_deep_idle(void);
 static void alarm_test_now(void);
 
 enum { GEST_NONE = 0, GEST_TAP, GEST_HOLD, GEST_SWIPE_UP, GEST_SWIPE_DOWN,
@@ -41,6 +51,7 @@ enum { GEST_NONE = 0, GEST_TAP, GEST_HOLD, GEST_SWIPE_UP, GEST_SWIPE_DOWN,
 static void time_str(char* out, int n);
 
 static bool furthest_ahead(void);
+static void reader_progress(void);
 
 /* ---- lightweight perf telemetry (DEV_INJECT / benchmark builds) ---- */
 enum { PERF_PAGE = 1, PERF_MENU, PERF_MENU_CLOSE, PERF_OPEN,
@@ -72,7 +83,7 @@ static void perf_add(int kind, uint32_t total_us, uint32_t draw_us, uint32_t aux
 static void perf_dump(void)
 {
     char b[192];
-    snprintf(b, sizeof(b), "PERF n=%d", g_perf_n); brd_log(b);
+    snprintf(b, sizeof(b), "PERF n=%d", g_perf_n); brd_log_sync(b);
     for (int i = 0; i < g_perf_n; i++) {
         PerfEvent* e = &g_perf[i];
         snprintf(b, sizeof(b),
@@ -81,10 +92,53 @@ static void perf_dump(void)
                  (unsigned long)e->draw_us, (unsigned long)e->pack_us,
                  (unsigned long)e->push_us, (unsigned long)e->panel_us,
                  (unsigned long)e->aux);
-        brd_log(b);
+        brd_log_sync(b);
     }
 }
 static void perf_start(int kind) { g_evt_kind = kind; g_evt_t0 = (uint32_t)brd_us(); }
+
+/* ---- core-0 I/O worker ------------------------------------------------
+   One job in flight. The worker only touches the SD card, the ZIP reader
+   and the text folder; pagination/image decoding stay on the UI core
+   because M5GFX is not thread-safe. */
+enum { IO_COUNT = 1, IO_SEARCH, IO_PREFETCH, IO_FLUSH };
+typedef struct {
+    int  kind;
+    int  ch;
+    char query[64];
+    char path[300];
+    BookState bs;
+} IoJob;
+
+static bool g_io_ok;
+static volatile bool g_io_busy;
+
+#ifndef HOST_GUI
+#include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
+#include "freertos/semphr.h"
+#include "freertos/task.h"
+static QueueHandle_t     g_io_q;
+static SemaphoreHandle_t g_io_done;
+static volatile bool     g_io_running;
+static struct {
+    int kind;
+    int ch;
+    int nres;
+    char* text;
+    size_t len;
+    uint32_t dur_us;
+} g_io_res;
+#endif
+
+static bool io_worker_init(void);
+static bool io_enqueue_count(int ch);
+static bool io_enqueue_search(const char* q);
+static bool io_enqueue_prefetch(int ch);
+static bool io_enqueue_flush(const char* path, const BookState* bs);
+static void io_worker_poll(void);
+static void io_wait_idle(void);
+static void search_poll(void);
 
 static int g_display_mode;
 
@@ -237,16 +291,16 @@ static void ui_list_row(int x, int y, int w, int h, const char* text, const char
 
 static void ui_busy(const char* msg)
 {
-    brd_log("BUSY begin");
+    APP_LOGD("BUSY begin");
     int W = brd_width(), H = brd_height();
     int y = H / 2 - 45;
     brd_fill_rect(0, y, W, 90, th.bg);
     brd_hline(0, y, W, th.border);
     brd_hline(0, y + 89, W, th.border);
     ui_center(msg, H / 2 - brd_font_h(2) / 2, 2, th.fg);
-    brd_log("BUSY refresh");
+    APP_LOGD("BUSY refresh");
     brd_refresh_region(0, y, W, 90, 2);
-    brd_log("BUSY done");
+    APP_LOGD("BUSY done");
 }
 
 // ---------------------------------------------------------------- data
@@ -258,6 +312,8 @@ typedef struct {
 static Entry* g_entries;
 static int    g_nitems;
 static int    g_scroll;
+static int    g_lib_partials;    /* consecutive regional page scrolls */
+static bool   g_lib_page_only;   /* next library_draw is a page scroll */
 
 /* Metadata cache: opening every EPUB on every boot is the main library
    latency source. Titles are immutable for a given path; cache them on SD. */
@@ -360,14 +416,26 @@ static int cmp_entry(const void* a, const void* b)
 
 static void library_scan(void)
 {
-    int cap = lib_scan(BOOKS_DIR, NULL, 0);
-    if (cap < 4) cap = 4;
-    LibItem* tmp = (LibItem*)u_alloc((size_t)cap * sizeof(LibItem));
-    int n = tmp ? lib_scan(BOOKS_DIR, tmp, cap) : 0;
+    /* Single directory pass (no separate count scan) and metadata only:
+       the old path issued two readdir/stat passes plus one state-file open
+       per book for a progress value the UI never shows. */
+    int cap = 64;
+    LibItem* tmp = NULL;
+    int n = 0;
+    for (;;) {
+        tmp = (LibItem*)u_alloc((size_t)cap * sizeof(LibItem));
+        if (!tmp) return;
+        n = lib_scan_fast(BOOKS_DIR, tmp, cap);
+        if (n <= cap) break;
+        free(tmp);
+        tmp = NULL;
+        cap *= 2;
+        if (cap > 8192) return;
+    }
     g_entries = (Entry*)u_alloc((size_t)(n ? n : 1) * sizeof(Entry));
     g_nitems = 0;
     title_cache_load();
-    if (!tmp || !g_entries) { free(tmp); return; }
+    if (!g_entries) { free(tmp); return; }
     for (int i = 0; i < n; i++) {
         if (tmp[i].is_dir) continue;
         Entry* e = &g_entries[g_nitems];
@@ -414,6 +482,276 @@ static uint32_t g_state_dirty_at;
 static int g_search_origin_ch;
 static int g_search_origin_pg;
 static bool g_search_origin_valid;
+static bool g_search_active;    /* worker search in flight */
+static bool g_search_enqueued;  /* search job accepted by the queue */
+
+/* ---- rolling reader window --------------------------------------------
+   A small ring of neighbouring chapters keeps text and layout ready so
+   crossing a chapter boundary is a pointer switch, not an "Opening
+   chapter..." interruption. The window is measured in pages: 8 pages on
+   each side in normal reading, 12 pages in the direction of a fast flip. */
+#define RC_N 4
+#define RC_TEXT_MAX (3u * 1024u * 1024u)
+#define WIN_PAGES 8
+#define WIN_FAST_PAGES 12
+
+typedef struct {
+    int ch;
+    char* text;
+    size_t len;
+    Layout* lay;
+    uint32_t used;
+} ReaderChapter;
+
+static ReaderChapter g_rc[RC_N];
+static uint32_t g_rc_tick;
+static size_t g_rc_bytes;
+static uint32_t g_last_input;
+static int g_fast_dir;        /* -1 backward, +1 forward, 0 symmetric */
+static int g_turn_dir;
+static int g_turn_streak;
+static uint32_t g_turn_last_ms;
+static int  g_pre_bad = -1;   /* chapter that failed to prefetch */
+static uint32_t g_pre_bad_at; /* failure time: retry after the cooldown */
+static bool g_pre_waiting;    /* window prefetch in flight */
+static int  g_pending_dir;    /* page turn waiting for a cache fill */
+static int  g_pending_steps;
+static uint32_t g_pending_at;
+static uint32_t g_win_miss;   /* cache misses on page turns */
+static uint32_t g_pre_ms;     /* last prefetch+layout duration */
+#define FAST_FLIPS 6          /* boost only after six same-direction flips */
+#define IDLE_READ_MS 1500     /* a gap this long means the reader paused */
+#define TURN_GAP_MS 3000      /* gap that breaks a same-direction flip burst */
+#define PRE_BAD_MS 30000      /* retry a failed neighbour after 30 s */
+
+/* A transient SD/extract failure must not blacklist a chapter forever: after
+   the cooldown the prefetcher is allowed to try it again. */
+static bool pre_bad_is(int ch)
+{
+    if (ch != g_pre_bad) return false;
+    if ((uint32_t)(brd_millis() - g_pre_bad_at) < PRE_BAD_MS) return true;
+    g_pre_bad = -1;
+    return false;
+}
+
+static ReaderChapter* rc_find(int ch)
+{
+    for (int i = 0; i < RC_N; i++)
+        if (g_rc[i].ch == ch && g_rc[i].text) return &g_rc[i];
+    return NULL;
+}
+
+static void rc_touch(ReaderChapter* e) { e->used = ++g_rc_tick; }
+
+static void rc_free_slot(ReaderChapter* e)
+{
+    if (e->text) {
+        if (g_rc_bytes >= e->len) g_rc_bytes -= e->len;
+        else g_rc_bytes = 0;
+        free(e->text);
+    }
+    if (e->lay) pg_free(e->lay);
+    e->ch = -1;
+    e->text = NULL;
+    e->len = 0;
+    e->lay = NULL;
+    e->used = 0;
+}
+
+static void rc_clear(void)
+{
+    for (int i = 0; i < RC_N; i++) rc_free_slot(&g_rc[i]);
+    g_rc_bytes = 0;
+    g_rc_tick = 0;
+}
+
+static int chapter_pages_est(int ch)
+{
+    int p = (ch >= 0 && ch < 256) ? R.bs.page_counts[ch] : -1;
+    if (p > 0) return p;
+    ReaderChapter* e = rc_find(ch);
+    if (e && e->lay) return e->lay->npages;
+    return 10;   /* unknown: neutral estimate for eviction only */
+}
+
+/* distance in pages from the open page to a cached chapter */
+static int rc_distance(int ch)
+{
+    int d = 0;
+    if (ch > R.chapter) {
+        d = R.lay ? (R.lay->npages - 1 - R.page) : 0;
+        for (int c = R.chapter + 1; c < ch; c++) d += chapter_pages_est(c);
+    } else if (ch < R.chapter) {
+        d = R.page;
+        for (int c = ch + 1; c < R.chapter; c++) d += chapter_pages_est(c);
+    }
+    return d;
+}
+
+static ReaderChapter* rc_slot(void)
+{
+    for (int i = 0; i < RC_N; i++)
+        if (g_rc[i].ch < 0) return &g_rc[i];
+    ReaderChapter* best = NULL;
+    int bestd = -1;
+    for (int i = 0; i < RC_N; i++) {
+        if (g_rc[i].ch == R.chapter) continue;   /* never evict the open page */
+        int d = rc_distance(g_rc[i].ch);
+        if (!best || d > bestd || (d == bestd && g_rc[i].used < best->used)) {
+            best = &g_rc[i];
+            bestd = d;
+        }
+    }
+    return best;
+}
+
+static bool rc_adopt(int ch)
+{
+    ReaderChapter* e = rc_find(ch);
+    if (!e) return false;
+    R.chapter = ch;
+    R.text = e->text;
+    R.text_len = e->len;
+    R.lay = e->lay;
+    R.page = 0;
+    rc_touch(e);
+    return true;
+}
+
+static void rc_commit(int ch, char* text, size_t len, Layout* lay)
+{
+    if (!text || !lay) {
+        free(text);
+        if (lay) pg_free(lay);
+        return;
+    }
+    ReaderChapter* e = rc_slot();
+    if (!e) { free(text); pg_free(lay); return; }
+    rc_free_slot(e);
+    e->ch = ch;
+    e->text = text;
+    e->len = len;
+    e->lay = lay;
+    rc_touch(e);
+    g_rc_bytes += len;
+    if (ch >= 0 && ch < 256) R.bs.page_counts[ch] = lay->npages;
+    if (ch == g_pre_bad) g_pre_bad = -1;   /* a success clears the blacklist */
+    while (g_rc_bytes > RC_TEXT_MAX) {
+        ReaderChapter* v = NULL;
+        int vd = -1;
+        for (int i = 0; i < RC_N; i++) {
+            if (g_rc[i].ch < 0 || g_rc[i].ch == R.chapter || g_rc[i].ch == ch) continue;
+            int d = rc_distance(g_rc[i].ch);
+            if (!v || d > vd || (d == vd && g_rc[i].used < v->used)) {
+                v = &g_rc[i];
+                vd = d;
+            }
+        }
+        if (!v) break;
+        rc_free_slot(v);
+    }
+}
+
+static int rc_pages_cached(int ch)
+{
+    ReaderChapter* e = rc_find(ch);
+    return (e && e->lay) ? e->lay->npages : 0;
+}
+
+/* pages available from the open page in one direction (current chapter
+   remainder plus contiguous cached chapters) */
+static int coverage_pages(int dir)
+{
+    if (!R.lay) return 0;
+    int total = dir > 0 ? (R.lay->npages - 1 - R.page) : R.page;
+    int n = epub_chapter_count(R.ep);
+    for (int c = R.chapter + dir; c >= 0 && c < n; c += dir) {
+        int p = rc_pages_cached(c);
+        if (p <= 0) break;
+        total += p;
+        if (total >= 100000) break;
+    }
+    return total;
+}
+
+static int next_uncached(int dir)
+{
+    int n = epub_chapter_count(R.ep);
+    for (int c = R.chapter + dir; c >= 0 && c < n; c += dir) {
+        ReaderChapter* e = rc_find(c);
+        if (!e || !e->lay) {
+            if (pre_bad_is(c)) return -1;
+            return c;
+        }
+    }
+    return -1;
+}
+
+static int window_target(void)
+{
+    if (!R.ep || !R.lay) return -1;
+    if (g_fast_dir > 0) {
+        if (coverage_pages(1) < WIN_FAST_PAGES) return next_uncached(1);
+        return -1;
+    }
+    if (g_fast_dir < 0) {
+        if (coverage_pages(-1) < WIN_FAST_PAGES) return next_uncached(-1);
+        return -1;
+    }
+    if (coverage_pages(1) < WIN_PAGES) {
+        int t = next_uncached(1);
+        if (t >= 0) return t;
+    }
+    if (coverage_pages(-1) < WIN_PAGES) return next_uncached(-1);
+    return -1;
+}
+
+/* Complete a page turn that was waiting for its chapter to enter the cache. */
+static bool reader_pending_resolve(void)
+{
+    if (!g_pending_dir) return false;
+    int target = R.chapter + g_pending_dir;
+    ReaderChapter* e = rc_find(target);
+    if (!e || !e->lay) return false;
+    int np = e->lay->npages;
+    int steps = 1 + g_pending_steps;
+    int dir = g_pending_dir;
+    rc_adopt(target);
+    if (dir > 0) R.page = (steps - 1 < np) ? steps - 1 : np - 1;
+    else R.page = (np - steps >= 0) ? np - steps : 0;
+    g_pending_dir = 0;
+    g_pending_steps = 0;
+    reader_progress();
+    g_force = true;
+    return true;
+}
+
+static void reader_window_step(void)
+{
+    if (!R.ep || g_scr != SCR_READER || !R.lay) return;
+    if (g_pre_waiting) return;
+
+    if (g_pending_dir) {
+        if (reader_pending_resolve()) return;
+        int target = R.chapter + g_pending_dir;
+        int n = epub_chapter_count(R.ep);
+        if (target >= 0 && target < n && !pre_bad_is(target) && !rc_find(target)) {
+            if (io_enqueue_prefetch(target)) {
+                g_pre_waiting = true;
+            }
+        }
+        return;   /* the pending turn owns the bus */
+    }
+
+    uint32_t now = brd_millis();
+    bool idle = (uint32_t)(now - g_last_input) >= IDLE_READ_MS;
+    if (!idle && !g_fast_dir) return;
+    int ch = window_target();
+    if (ch < 0) return;
+    if (io_enqueue_prefetch(ch)) {
+        g_pre_waiting = true;
+    }
+}
 
 static void reader_state_flush(void)
 {
@@ -423,8 +761,18 @@ static void reader_state_flush(void)
     perf_add(PERF_STATE, (uint32_t)brd_us() - wt0, 0, 0);
     g_state_dirty = false;
 }
+
+/* Mark the book state dirty; the 2.5 s idle flush (or poweroff/exit) writes
+   it. Keeps the ~0.45 s SD write out of the tap/render path. */
+static void reader_state_dirty(void)
+{
+    g_state_dirty = true;
+    g_state_dirty_at = brd_millis();
+}
 static int  g_count_ch;
 static uint32_t g_count_pause_until;
+static bool g_count_waiting;    /* count job in flight */
+static uint32_t g_count_t0;
 
 static int reader_font_id(void)
 {
@@ -464,49 +812,76 @@ static int reader_margin(void) { return g_cfg.rd_margins == 0 ? 28 : (g_cfg.rd_m
 
 static void img_cache_clear(void);
 static void search_cache_clear(void);
-
-static void reader_free_layout(void)
-{
-    if (R.lay) { pg_free(R.lay); R.lay = NULL; }
-}
+static void cover_cache_clear(void);
 
 static void reader_free(void)
 {
     reader_state_flush();
     g_count_active = false;
-    reader_free_layout();
-    if (R.text) { free(R.text); R.text = NULL; }
-    if (R.ep) { epub_close(R.ep); R.ep = NULL; }
+    g_search_active = false;
+    g_search_enqueued = false;
+    g_count_waiting = false;
+    g_pre_waiting = false;
+    g_pre_bad = -1;
+    g_pending_dir = 0;
+    g_pending_steps = 0;
+    io_wait_idle();
+    R.text = NULL;
+    R.lay = NULL;
     R.text_len = 0;
+    if (R.ep) { epub_close(R.ep); R.ep = NULL; }
+    rc_clear();
     img_cache_clear();
     search_cache_clear();
+    cover_cache_clear();
 }
 
-static bool reader_load_chapter(int ch)
+static bool reader_load_chapter_ex(int ch, bool show_busy)
 {
     if (!R.ep) return false;
     int n = epub_chapter_count(R.ep);
     if (ch < 0 || ch >= n) return false;
+
+    if (rc_adopt(ch)) return true;   /* already in the rolling window */
+
     brd_cpu_freq(240);
-    ui_busy("Opening chapter...");
-    brd_log("CH free");
-    if (R.text) { free(R.text); R.text = NULL; }
-    reader_free_layout();
-    brd_log("CH text start");
-    R.text = epub_chapter_text(R.ep, ch, &R.text_len);
-    brd_log("CH text done");
-    if (!R.text) { brd_log("reader: chapter text null"); brd_cpu_freq(80); return false; }
-    R.chapter = ch;
-    R.page = 0;
+    if (show_busy) ui_busy("Opening chapter...");
+    APP_LOGD("CH text start");
+    size_t tl = 0;
+    char* t = epub_chapter_text(R.ep, ch, &tl);
+    APP_LOGD("CH text done");
+    if (!t) { APP_LOGD("reader: chapter text null"); brd_cpu_freq(80); return false; }
     int W = brd_width(), H = brd_height();
     int hdr = 32;
     int margin = reader_margin();
-    brd_log("CH layout start");
-    R.lay = pg_layout(R.text, R.text_len, W - 2 * margin, H - hdr - 40,
-                      reader_font_id(), g_cfg.rd_spacing * 4);
-    brd_log("CH layout done");
-    if (!R.lay) { brd_log("reader: layout null"); brd_cpu_freq(80); return false; }
+    APP_LOGD("CH layout start");
+    Layout* l = pg_layout(t, tl, W - 2 * margin, H - hdr - 40,
+                          reader_font_id(), g_cfg.rd_spacing * 4);
+    APP_LOGD("CH layout done");
+    if (!l) { APP_LOGD("reader: layout null"); free(t); brd_cpu_freq(80); return false; }
+    rc_commit(ch, t, tl, l);
+    rc_adopt(ch);
     brd_cpu_freq(80);
+    return true;
+}
+
+static bool reader_load_chapter(int ch) { return reader_load_chapter_ex(ch, true); }
+
+/* Load one chapter straight into the cache without switching the open page:
+   used by the initial window prime (inside the single "Opening book..." busy). */
+static bool reader_cache_load_now(int ch)
+{
+    if (!R.ep) return false;
+    int n = epub_chapter_count(R.ep);
+    if (ch < 0 || ch >= n || rc_find(ch)) return true;
+    size_t tl = 0;
+    char* t = epub_chapter_text(R.ep, ch, &tl);
+    if (!t) { g_pre_bad = ch; g_pre_bad_at = brd_millis(); return false; }
+    int W = brd_width(), H = brd_height();
+    Layout* l = pg_layout(t, tl, W - 2 * reader_margin(), H - 32 - 40,
+                          reader_font_id(), g_cfg.rd_spacing * 4);
+    if (!l) { free(t); g_pre_bad = ch; g_pre_bad_at = brd_millis(); return false; }
+    rc_commit(ch, t, tl, l);
     return true;
 }
 
@@ -527,30 +902,50 @@ static void book_count_start(void)
 static void book_count_step(void)
 {
     if (!g_count_active || !R.ep) return;
+    if (g_io_ok && g_count_waiting) return;   /* dispatcher applies the page count */
+    /* the rolling window owns the worker while a neighbour is missing */
+    if (g_io_ok && g_scr == SCR_READER && !g_pre_waiting && window_target() >= 0) return;
     if ((int32_t)(g_count_pause_until - brd_millis()) > 0) return;
     int nch = epub_chapter_count(R.ep);
     if (g_count_ch >= nch || g_count_ch >= 256) {
         g_count_active = false;
         R.bs.lkey = reading_layout_key();
-        st_book_put(R.path, &R.bs);
+        reader_state_dirty();
         g_force = true;
         return;
     }
-    int c = g_count_ch++;
-    if (c == R.chapter && R.lay) {
-        R.bs.page_counts[c] = R.lay->npages;
+    int c = g_count_ch;
+    ReaderChapter* cc = rc_find(c);
+    if (cc && cc->lay) {
+        R.bs.page_counts[c] = cc->lay->npages;   /* already paginated by the window */
+        g_count_ch++;
         return;
     }
+    if (c == R.chapter && R.lay) {
+        R.bs.page_counts[c] = R.lay->npages;
+        g_count_ch++;
+        return;
+    }
+    if (g_io_ok) {
+        if (!io_enqueue_count(c)) return;   /* bus busy: retry the same chapter */
+        g_count_ch++;
+        g_count_waiting = true;
+        g_count_t0 = (uint32_t)brd_us();
+        return;
+    }
+    g_count_ch++;
     size_t tl = 0;
     uint32_t ct0 = (uint32_t)brd_us();
+    brd_cpu_freq(240);   /* race-to-idle: finish the chapter, then sleep */
     char* t = epub_chapter_text(R.ep, c, &tl);
-    if (!t) { R.bs.page_counts[c] = 1; brd_delay(1); return; }
+    if (!t) { brd_cpu_freq(80); R.bs.page_counts[c] = 1; brd_delay(1); return; }
     int W = brd_width(), H = brd_height();
     Layout* l = pg_layout(t, tl, W - 2 * reader_margin(), H - 32 - 40,
                           reader_font_id(), g_cfg.rd_spacing * 4);
     R.bs.page_counts[c] = l ? l->npages : 1;
     if (l) pg_free(l);
     free(t);
+    brd_cpu_freq(80);
     perf_add(PERF_COUNT, (uint32_t)brd_us() - ct0, 0, (uint32_t)c);
     brd_delay(1);
 }
@@ -559,13 +954,13 @@ static void reader_open(const char* path)
 {
     uint32_t perf_t0 = (uint32_t)brd_us();
     g_search_origin_valid = false;
-    brd_log("reader: opening");
+    APP_LOGD("reader: opening");
     brd_cpu_freq(240);
     ui_busy("Opening book...");
     reader_free();
     R.ep = epub_open(path);
     if (!R.ep) {
-        brd_log("reader: epub_open failed");
+        APP_LOGD("reader: epub_open failed");
         ui_busy("Failed to open!");
         brd_delay(1200);
         g_scr = SCR_LIBRARY;
@@ -578,8 +973,9 @@ static void reader_open(const char* path)
     st_book_get(path, &R.bs);
     int ch = R.bs.last_ch;
     if (ch < 0 || ch >= epub_chapter_count(R.ep)) ch = 0;
+    g_pre_bad = -1;
     if (!reader_load_chapter(ch)) {
-        brd_log("reader: load_chapter failed");
+        APP_LOGD("reader: load_chapter failed");
         ui_busy("Failed to open!");
         brd_delay(1200);
         reader_free();
@@ -589,6 +985,15 @@ static void reader_open(const char* path)
     }
     R.page = R.bs.last_pg;
     if (R.page < 0 || R.page >= R.lay->npages) R.page = 0;
+    /* honor the ±8 page window at open without eager preloading: only when
+       the saved page is within 8 pages of a chapter boundary */
+    {
+        int nch = epub_chapter_count(R.ep);
+        int ahead = R.lay->npages - 1 - R.page;
+        int behind = R.page;
+        if (ahead < WIN_PAGES && ch + 1 < nch) reader_cache_load_now(ch + 1);
+        else if (behind < WIN_PAGES && ch > 0) reader_cache_load_now(ch - 1);
+    }
     if (R.bs.lkey != reading_layout_key() || R.bs.page_counts[R.chapter] <= 0)
         book_count_start();
     else
@@ -598,8 +1003,7 @@ static void reader_open(const char* path)
         (R.chapter == R.bs.furthest_ch && R.page > R.bs.furthest_pg)) {
         R.bs.furthest_ch = R.chapter; R.bs.furthest_pg = R.page;
     }
-    st_book_put(R.path, &R.bs);
-    g_state_dirty = false;
+    reader_state_dirty();
     perf_add(PERF_OPEN, (uint32_t)brd_us() - perf_t0, 0, (uint32_t)epub_chapter_count(R.ep));
     g_reader_full = true;
     g_scr = SCR_READER;
@@ -622,8 +1026,77 @@ static void reader_progress(void)
     }
     R.bs.last_ch = R.chapter;
     R.bs.last_pg = R.page;
-    g_state_dirty = true;
-    g_state_dirty_at = brd_millis();
+    reader_state_dirty();
+}
+
+/* Page turn with the rolling window: inside a chapter it is a page index
+   change; at a boundary it is a cache pointer switch, so the "Opening
+   chapter..." busy screen only survives as a fallback when the prefetcher
+   has not caught up. Fast flips raise the CPU and bias the window forward
+   or backward until the reader calms down. */
+static void reader_turn(int dir)
+{
+    if (!R.ep || !R.lay) return;
+    uint32_t now = brd_millis();
+
+    /* a turn waiting for a cache fill absorbs further taps in the same
+       direction; an opposite tap cancels it */
+    if (g_pending_dir && dir != g_pending_dir) {
+        g_pending_dir = 0;
+        g_pending_steps = 0;
+    }
+    if (g_pending_dir) {
+        /* queued taps still contribute to the fast-flip threshold */
+        if (dir == g_turn_dir && (uint32_t)(now - g_turn_last_ms) < TURN_GAP_MS) g_turn_streak++;
+        else { g_turn_dir = dir; g_turn_streak = 1; }
+        g_turn_last_ms = now;
+        if (g_turn_streak >= FAST_FLIPS) g_fast_dir = dir;
+        g_pending_steps++;
+        return;
+    }
+
+    if (dir == g_turn_dir && (uint32_t)(now - g_turn_last_ms) < TURN_GAP_MS) g_turn_streak++;
+    else { g_turn_dir = dir; g_turn_streak = 1; }
+    g_turn_last_ms = now;
+    /* boost and directional window only after six same-direction flips */
+    if (g_turn_streak >= FAST_FLIPS) g_fast_dir = dir;
+
+    if (dir > 0) {
+        if (R.page + 1 < R.lay->npages) {
+            R.page++;
+        } else if (R.chapter + 1 < epub_chapter_count(R.ep)) {
+            if (!rc_adopt(R.chapter + 1)) {
+                /* no extraction in the tap path: the tap waits for the worker */
+                g_pending_dir = dir;
+                g_pending_steps = 0;
+                g_pending_at = now;
+                g_win_miss++;
+                return;
+            }
+            R.page = 0;
+        } else {
+            return;
+        }
+    } else {
+        if (R.page > 0) {
+            R.page--;
+        } else if (R.chapter > 0) {
+            if (!rc_adopt(R.chapter - 1)) {
+                g_pending_dir = dir;
+                g_pending_steps = 0;
+                g_pending_at = now;
+                g_win_miss++;
+                return;
+            }
+            R.page = R.lay->npages - 1;
+        } else {
+            return;
+        }
+    }
+    g_pending_dir = 0;
+    g_pending_steps = 0;
+    reader_progress();
+    g_force = true;
 }
 
 static void bookmark_toggle(void)
@@ -637,8 +1110,7 @@ static void bookmark_toggle(void)
         R.bs.bm[R.bs.bm_count].pg = R.page;
         R.bs.bm_count++;
     }
-    st_book_put(R.path, &R.bs);
-    g_state_dirty = false;
+    reader_state_dirty();
 }
 
 static void total_pages(int* total, int* before)
@@ -666,6 +1138,26 @@ static void img_cache_clear(void)
         free(g_imgc[i].data); g_imgc[i].data = NULL; g_imgc[i].len = 0; g_imgc[i].key[0] = 0;
     }
     g_imgc_rot = 0;
+}
+
+/* Decoded cover cache: re-entering page 1 of chapter 0 (bookmark/back)
+   must not re-extract and re-decode the image every time. */
+static struct {
+    char path[300];
+    uint16_t* px;
+    int w, h;          /* decoded size */
+    int maxw, maxh;    /* decode constraints (invalidate on rotation) */
+    uint16_t bg;       /* theme background used for transparency */
+} g_cover;
+
+static void cover_cache_clear(void)
+{
+    free(g_cover.px);
+    g_cover.px = NULL;
+    g_cover.w = g_cover.h = 0;
+    g_cover.maxw = g_cover.maxh = 0;
+    g_cover.bg = 0;
+    g_cover.path[0] = 0;
 }
 
 #define SEARCH_CACHE_N 3
@@ -731,16 +1223,10 @@ static char* img_fetch(const char* href, size_t* len)
         img = epub_image(R.ep, alt, len);
     }
     if (!img) {
-        char m[280];
-        snprintf(m, sizeof(m), "IMG miss %s", href);
-        brd_log(m);
+        APP_LOGD("IMG miss");
         return NULL;
     }
-    {
-        char m[280];
-        snprintf(m, sizeof(m), "IMG ok %s len=%u", href, (unsigned)*len);
-        brd_log(m);
-    }
+    APP_LOGD("IMG ok");
     int slot = g_imgc_rot++ % IMG_CACHE_N;
     free(g_imgc[slot].data);
     snprintf(g_imgc[slot].key, sizeof(g_imgc[slot].key), "%s", key);
@@ -772,36 +1258,47 @@ static void reader_draw(void)
     int last = R.lay->page_first[R.page + 1];
     bool empty_page = first >= last;
     bool cover = cover_page();
+#if DIAG_LOG
     if (R.chapter == 0 && R.page == 0) {
         char m[96];
         snprintf(m, sizeof(m), "P1 cover=%d images=%d", cover, g_cfg.images);
         brd_log(m);
     }
+#endif
     if (cover && g_cfg.images) {
+        int maxw = W - 8, maxh = H - 40;
+        if (g_cover.px && g_cover.maxw == maxw && g_cover.maxh == maxh &&
+            g_cover.bg == th.bg && !strcmp(g_cover.path, R.path)) {
+            brd_draw_rgb565((W - g_cover.w) / 2, 30 + (H - 30 - g_cover.h) / 2,
+                            g_cover.w, g_cover.h, g_cover.px);
+            brd_refresh(0);
+            g_reader_full = false;
+            return;
+        }
         size_t clen = 0;
         char* cov = epub_cover(R.ep, &clen);
         if (cov) {
-            char m[128];
-            snprintf(m, sizeof(m), "COVER len=%u hdr=%02x%02x%02x%02x",
-                     (unsigned)clen, (unsigned char)cov[0], (unsigned char)cov[1],
-                     (unsigned char)cov[2], (unsigned char)cov[3]);
-            brd_log(m);
+            APP_LOGD("COVER extract ok");
             int dw = 0, dh = 0;
-            uint16_t* px = brd_img_decode((const uint8_t*)cov, clen, W - 8, H - 40, th.bg, &dw, &dh);
+            uint16_t* px = brd_img_decode((const uint8_t*)cov, clen, maxw, maxh, th.bg, &dw, &dh);
             free(cov);
             if (px) {
-                char dm[64];
-                snprintf(dm, sizeof(dm), "COVER decode %dx%d", dw, dh);
-                brd_log(dm);
+                cover_cache_clear();
+                snprintf(g_cover.path, sizeof(g_cover.path), "%s", R.path);
+                g_cover.px = px;
+                g_cover.w = dw;
+                g_cover.h = dh;
+                g_cover.maxw = maxw;
+                g_cover.maxh = maxh;
+                g_cover.bg = th.bg;
                 brd_draw_rgb565((W - dw) / 2, 30 + (H - 30 - dh) / 2, dw, dh, px);
-                free(px);
                 brd_refresh(0);
                 g_reader_full = false;
                 return;
             }
-            else brd_log("COVER decode fail");
+            APP_LOGD("COVER decode fail");
         }
-        else brd_log("COVER null");
+        else APP_LOGD("COVER null");
     }
     if (empty_page) {
         ui_center(R.title, H / 2 - 28, 2, th.fg);
@@ -839,11 +1336,7 @@ static void reader_draw(void)
                         brd_draw_rgb565(margin + (W - 2 * margin - dw) / 2, y, dw, dh, px);
                         free(px);
                     } else {
-                        char dm[280];
-                        snprintf(dm, sizeof(dm), "IMG decode fail %s len=%u hdr=%02x%02x%02x%02x",
-                                 line, (unsigned)ilen, (unsigned char)img[0], (unsigned char)img[1],
-                                 (unsigned char)img[2], (unsigned char)img[3]);
-                        brd_log(dm);
+                        APP_LOGD("IMG decode fail");
                     }
                 }
             }
@@ -869,15 +1362,31 @@ static void reader_draw(void)
         brd_refresh(mode);
         g_partial_count = 0;
     }
-    brd_cpu_freq(80);   /* idle/reading cadence is set by app_loop */
+    /* fast flipping keeps the CPU boosted until app_loop sees the reader idle */
+    brd_cpu_freq(g_fast_dir ? 240 : 80);
 }
 
 // ---------------------------------------------------------------- library drawing
 static void library_draw(void)
 {
     int W = brd_width(), H = brd_height();
-    ui_clear();
-    ui_statusbar(NULL, NULL, false, false);
+    bool partial = g_lib_page_only;
+    g_lib_page_only = false;
+    if (partial) {
+        /* periodic quality refresh keeps ghosting bounded */
+        if (++g_lib_partials >= 8) { partial = false; g_lib_partials = 0; }
+    } else {
+        g_lib_partials = 0;
+    }
+    if (!partial) {
+        ui_clear();
+        ui_statusbar(NULL, NULL, false, false);
+    } else {
+        /* page scroll: repaint only the list band (rows + counter); the
+           status bar is redrawn separately so clock/battery stay current */
+        brd_fill_rect(0, 56, W, H - 56, th.bg);
+        ui_statusbar(NULL, NULL, false, false);
+    }
     int rows = 11;
     int y0 = 56;
     int rh = 75;
@@ -897,7 +1406,12 @@ static void library_draw(void)
         snprintf(p, sizeof(p), "%d/%d >", g_scroll / rows + 1, pages);
         ui_center(p, H - 34, 2, th.fg);
     }
-    brd_refresh(0);
+    if (partial) {
+        brd_refresh_region(0, 56, W, H - 56, 2);
+        brd_refresh_region(0, 0, W, 33, 2);
+    } else {
+        brd_refresh(0);
+    }
 }
 
 static void library_input(int g, int x, int y)
@@ -906,12 +1420,14 @@ static void library_input(int g, int x, int y)
     int rows = 11;
     int y0 = 56;
     int rh = 75;
-    brd_log("DBG library_input entered");
-    if (g == GEST_SWIPE_UP) { brd_log("DBG library -> libmenu"); g_scr = SCR_LIBMENU; g_libmenu_guard = brd_millis() + 500; g_force = true; return; }
+    APP_LOGD("DBG library_input entered");
+    if (g == GEST_SWIPE_UP) { APP_LOGD("DBG library -> libmenu"); g_scr = SCR_LIBMENU; g_libmenu_guard = brd_millis() + 500; g_force = true; return; }
     if (g != GEST_TAP) return;
     if (y > H - 38) {
         g_scroll += rows;
         if (g_scroll >= g_nitems) g_scroll = 0;
+        g_lib_page_only = true;   /* regional refresh, not a quality full */
+        perf_start(PERF_LAYOUT);  /* telemetry: library page scroll */
         g_force = true;
         return;
     }
@@ -950,12 +1466,16 @@ static void boot_screen_draw(void)
     brd_text(tx + 1, ty + 1, title, 0x0000, 4);
     int sx = (W - brd_text_w(sub, 2)) / 2;
     brd_text(sx, ty + 50, sub, 0x0000, 2);
+    /* firmware version: small but readable, bottom centre (also shown on
+       the screen left visible when the device powers off) */
+    ui_center(APP_VERSION, H - brd_font_h(1) - 12, 1, 0x0000);
     brd_refresh(0);
 }
 
 static void poweroff_now(void)
 {
     reader_state_flush();
+    io_wait_idle();
     batt_flush();
     st_save_cfg();
     brd_rtc_sync();
@@ -1076,13 +1596,25 @@ static void menu_commit_font(void)
 {
     if (!g_font_dirty) return;
     int keep = R.page;
+    /* new metrics invalidate every cached layout */
+    g_pre_waiting = false;
+    g_pre_bad = -1;
+    g_pending_dir = 0;
+    g_pending_steps = 0;
+    g_count_waiting = false;
+    g_count_active = false;
+    io_wait_idle();
+    rc_clear();
+    R.text = NULL;
+    R.lay = NULL;
+    R.text_len = 0;
     if (reader_load_chapter(R.chapter)) {
         R.page = keep;
         if (R.page >= R.lay->npages) R.page = R.lay->npages - 1;
         R.bs.lkey = 0;
         book_count_start();
         R.bs.last_pg = R.page;
-        st_book_put(R.path, &R.bs);
+        reader_state_dirty();
         g_reader_full = true;
     }
     g_font_dirty = false;
@@ -1121,7 +1653,7 @@ static void menu_input(int g, int x, int y)
                 R.page = R.bs.furthest_pg;
                 if (R.page >= R.lay->npages) R.page = R.lay->npages - 1;
                 R.bs.last_pg = R.page;
-                st_book_put(R.path, &R.bs);
+                reader_state_dirty();
                 g_scr = SCR_READER;
             }
             g_force = true; return;
@@ -1483,6 +2015,13 @@ static void wifi_field_draw(void)
     ui_text_trunc(30, 56, W - 60, shown, th.fg, 2);
 }
 
+static void wifi_utc_draw(void)
+{
+    ui_button(224, 92, 52, 40, "-", false, 2);
+    { char u[8]; snprintf(u, sizeof(u), "%+d", g_cfg.utc_offset); brd_text(300 - brd_text_w(u, 2) / 2, 99, u, th.fg, 2); }
+    ui_button(320, 92, 52, 40, "+", false, 2);
+}
+
 static void wifi_draw(void)
 {
     int W = brd_width(), H = brd_height();
@@ -1502,9 +2041,7 @@ static void wifi_draw(void)
     ui_text(24, 34, label, th.dim, 1);
     wifi_field_draw();
     ui_text(24, 98, "UTC offset:", th.fg, 2);
-    ui_button(224, 92, 52, 40, "-", false, 2);
-    { char u[8]; snprintf(u, sizeof(u), "%+d", g_cfg.utc_offset); brd_text(300 - brd_text_w(u, 2) / 2, 99, u, th.fg, 2); }
-    ui_button(320, 92, 52, 40, "+", false, 2);
+    wifi_utc_draw();
     key_draw(keys_for_page(), KEY_Y, 2);
     brd_hline(0, H - 60, W, th.border);
     ui_center("Back", H - 60 + (60 - brd_font_h(2)) / 2, 2, th.fg);
@@ -1514,11 +2051,23 @@ static void wifi_draw(void)
 static void wifi_connect(void)
 {
     ui_busy("Connecting to WiFi...");
-    int r = brd_wifi_sync(g_wifi_ssid, g_wifi_pass, g_cfg.utc_offset, 20, NULL, 0);
+    /* W1: reuse the last BSSID/channel to skip the initial scan. */
+    uint8_t bssid[6];
+    int channel = 0;
+    bool fast = st_wifi_fast_get(g_wifi_ssid, bssid, &channel);
+    int r = brd_wifi_sync(g_wifi_ssid, g_wifi_pass, g_cfg.utc_offset, 20,
+                          fast ? bssid : NULL, fast ? channel : 0);
+    if (fast && r == 1) {
+        /* Stale BSSID/channel (AP moved): fall back to a normal scan once. */
+        r = brd_wifi_sync(g_wifi_ssid, g_wifi_pass, g_cfg.utc_offset, 20, NULL, 0);
+    }
     if (r == 1) { g_wifi_state = 1; snprintf(g_wifi_err, sizeof(g_wifi_err), "SSID not found"); brd_wifi_off(); }
     else if (r == 2) { g_wifi_state = 1; snprintf(g_wifi_err, sizeof(g_wifi_err), "NTP sync timed out"); brd_wifi_off(); }
     else {
-        st_wifi_save(g_wifi_ssid, g_wifi_pass);
+        uint8_t nb[6];
+        brd_wifi_bssid(nb);
+        int nch = brd_wifi_channel();
+        if (nch >= 1 && nch <= 14) st_wifi_fast_save(g_wifi_ssid, nb, nch);
         g_cfg.ntp_synced = true; g_cfg.ntp_epoch = brd_epoch();
         st_save_cfg(); brd_rtc_sync(); brd_wifi_off();
         g_scr = SCR_SETTINGS;
@@ -1551,26 +2100,46 @@ static void wifi_input(int g, int x, int y)
         return;
     }
     if (y > H - 40) { g_scr = SCR_SETTINGS; g_force = true; return; }
-    if (ui_hit(224, 92, 52, 40, x, y)) { g_cfg.utc_offset--; brd_apply_tz(g_cfg.utc_offset); st_save_cfg(); g_force = true; return; }
-    if (ui_hit(324, 92, 52, 40, x, y)) { g_cfg.utc_offset++; brd_apply_tz(g_cfg.utc_offset); st_save_cfg(); g_force = true; return; }
+    if (ui_hit(224, 92, 52, 40, x, y)) {
+        g_cfg.utc_offset--; brd_apply_tz(g_cfg.utc_offset); st_save_cfg();
+        wifi_utc_draw();
+        brd_refresh_region(200, 86, 200, 52, 2);
+        g_force = false;
+        return;
+    }
+    if (ui_hit(324, 92, 52, 40, x, y)) {
+        g_cfg.utc_offset++; brd_apply_tz(g_cfg.utc_offset); st_save_cfg();
+        wifi_utc_draw();
+        brd_refresh_region(200, 86, 200, 52, 2);
+        g_force = false;
+        return;
+    }
     const Key* k = keys_for_page();
     int idx = key_hit(k, KEY_Y, x, y);
     if (idx < 0) return;
     char* dst = g_wifi_field ? g_wifi_pass : g_wifi_ssid;
     int len = (int)strlen(dst);
     bool field_only = false;
+    bool page_only = false;
     switch (k[idx].action) {
-    case 1: g_wifi_page = g_wifi_page == 0 ? 1 : 0; break;
+    case 1: g_wifi_page = g_wifi_page == 0 ? 1 : 0; page_only = true; break;
     case 2: if (len) { dst[len - 1] = 0; field_only = true; } break;
     case 3: if (len < 63) { dst[len] = ' '; dst[len + 1] = 0; field_only = true; } break;
     case 4:
         if (!g_wifi_field) { if (g_wifi_ssid[0]) { g_wifi_field = 1; g_wifi_page = 0; } }
         else wifi_connect();
         return;
-    case 6: g_wifi_page = g_wifi_page == 2 ? 0 : 2; break;
+    case 6: g_wifi_page = g_wifi_page == 2 ? 0 : 2; page_only = true; break;
     default:
         if (k[idx].ch && len < 63) { dst[len] = k[idx].ch; dst[len + 1] = 0; field_only = true; }
         break;
+    }
+    if (page_only) {
+        /* same keyboard, new labels: repaint only that band */
+        key_draw(keys_for_page(), KEY_Y, 2);
+        brd_refresh_region(0, KEY_Y - 4, W, 4 * (KEY_KH + KEY_GAP) + 8, 2);
+        g_force = false;
+        return;
     }
     if (field_only) {
         wifi_field_draw();
@@ -1608,13 +2177,238 @@ static const char* stristr_word_len(const char* hay, const char* needle, size_t 
     return NULL;
 }
 
+/* ---------------------------------------------------------------- worker */
+#ifndef HOST_GUI
+static void io_task(void* arg)
+{
+    (void)arg;
+    for (;;) {
+        IoJob job;
+        if (xQueueReceive(g_io_q, &job, portMAX_DELAY) != pdTRUE) continue;
+        g_io_running = true;
+        g_io_res.kind = job.kind;
+        g_io_res.ch = job.ch;
+        g_io_res.nres = 0;
+        g_io_res.text = NULL;
+        g_io_res.len = 0;
+        g_io_res.dur_us = 0;
+        switch (job.kind) {
+        case IO_COUNT:
+        case IO_PREFETCH: {
+            uint32_t t0 = (uint32_t)brd_us();
+            g_io_res.text = epub_chapter_text(R.ep, job.ch, &g_io_res.len);
+            g_io_res.dur_us = (uint32_t)brd_us() - t0;
+            break; }
+        case IO_SEARCH: {
+            int n = 0;
+            size_t qlen = strlen(job.query);
+            int nch = epub_chapter_count(R.ep);
+            for (int c = 0; c < nch && n < 100; c++) {
+                size_t tl = 0;
+                char* t = search_cache_get(c, &tl);
+                bool owned = false;
+                if (!t) {
+                    t = epub_chapter_text(R.ep, c, &tl);
+                    if (!t) continue;
+                    owned = !search_cache_put(c, t, tl);
+                }
+                const char* p = t;
+                while (n < 100) {
+                    const char* h = stristr_word_len(p, job.query, qlen);
+                    if (!h) break;
+                    int off = (int)(h - t);
+                    int st = off > 32 ? off - 32 : 0;
+                    int sn = 70; if (st + sn > (int)tl) sn = (int)tl - st;
+                    if (sn < 0) sn = 0;
+                    memcpy(g_results[n].snippet, t + st, (size_t)sn);
+                    g_results[n].snippet[sn] = 0;
+                    g_results[n].ch = c;
+                    g_results[n].off = (uint32_t)off;
+                    n++;
+                    p = h + 1;
+                }
+                if (owned) free(t);
+                vTaskDelay(1);
+            }
+            g_io_res.nres = n;
+            break; }
+        case IO_FLUSH: {
+            uint32_t t0 = (uint32_t)brd_us();
+            st_book_put(job.path, &job.bs);
+            g_io_res.dur_us = (uint32_t)brd_us() - t0;
+            break; }
+        }
+        g_io_running = false;
+        xSemaphoreGive(g_io_done);
+    }
+}
+#endif
+
+static bool io_worker_init(void)
+{
+#ifdef HOST_GUI
+    return false;
+#else
+    g_io_q = xQueueCreate(1, sizeof(IoJob));
+    g_io_done = xSemaphoreCreateBinary();
+    if (!g_io_q || !g_io_done) return false;
+    if (xTaskCreatePinnedToCore(io_task, "lysis-io", 24576, NULL, 1, NULL, 0) != pdPASS) return false;
+    g_io_ok = true;
+    return true;
+#endif
+}
+
+static bool io_enqueue(int kind, int ch, const char* query, const char* path, const BookState* bs)
+{
+#ifdef HOST_GUI
+    (void)kind; (void)ch; (void)query; (void)path; (void)bs;
+    return false;
+#else
+    if (!g_io_ok || g_io_busy) return false;
+    IoJob job;
+    memset(&job, 0, sizeof(job));
+    job.kind = kind;
+    job.ch = ch;
+    if (query) snprintf(job.query, sizeof(job.query), "%s", query);
+    if (path) snprintf(job.path, sizeof(job.path), "%s", path);
+    if (bs) job.bs = *bs;
+    if (xQueueSend(g_io_q, &job, 0) != pdTRUE) return false;
+    g_io_busy = true;
+    return true;
+#endif
+}
+
+static bool io_enqueue_count(int ch) { return io_enqueue(IO_COUNT, ch, NULL, NULL, NULL); }
+static bool io_enqueue_search(const char* q) { return io_enqueue(IO_SEARCH, 0, q, NULL, NULL); }
+static bool io_enqueue_prefetch(int ch) { return io_enqueue(IO_PREFETCH, ch, NULL, NULL, NULL); }
+static bool io_enqueue_flush(const char* path, const BookState* bs) { return io_enqueue(IO_FLUSH, 0, NULL, path, bs); }
+
+static void io_worker_poll(void)
+{
+#ifdef HOST_GUI
+    return;
+#else
+    if (!g_io_ok || !g_io_busy) return;
+    if (xSemaphoreTake(g_io_done, 0) != pdTRUE) return;
+    if (g_io_res.kind == IO_COUNT) {
+        if (g_count_waiting) {
+            int c = g_io_res.ch;
+            if (c >= 0 && c < 256) {
+                uint32_t lt0 = (uint32_t)brd_us();
+                ReaderChapter* cc = rc_find(c);
+                if (cc && cc->lay) {
+                    /* the window paginated this chapter while the count job
+                       was in flight: reuse its layout, do not redo it */
+                    R.bs.page_counts[c] = cc->lay->npages;
+                } else if (g_io_res.text) {
+                    int W = brd_width(), H = brd_height();
+                    Layout* l = pg_layout(g_io_res.text, g_io_res.len,
+                                          W - 2 * reader_margin(), H - 32 - 40,
+                                          reader_font_id(), g_cfg.rd_spacing * 4);
+                    R.bs.page_counts[c] = l ? l->npages : 1;
+                    if (l) pg_free(l);
+                } else {
+                    R.bs.page_counts[c] = 1;
+                }
+                perf_add(PERF_COUNT, g_io_res.dur_us + ((uint32_t)brd_us() - lt0), 0, (uint32_t)c);
+            }
+            free(g_io_res.text);
+            g_io_res.text = NULL;
+            g_count_waiting = false;
+        } else {
+            free(g_io_res.text);
+            g_io_res.text = NULL;
+        }
+    } else if (g_io_res.kind == IO_PREFETCH) {
+        uint32_t lt0 = (uint32_t)brd_us();
+        bool ok = false;
+        if (g_pre_waiting) {
+            if (g_io_res.text && g_io_res.ch != R.chapter && !rc_find(g_io_res.ch)) {
+                int W = brd_width(), H = brd_height();
+                Layout* l = pg_layout(g_io_res.text, g_io_res.len,
+                                      W - 2 * reader_margin(), H - 32 - 40,
+                                      reader_font_id(), g_cfg.rd_spacing * 4);
+                if (l) {
+                    rc_commit(g_io_res.ch, g_io_res.text, g_io_res.len, l);
+                    g_io_res.text = NULL;
+                    ok = true;
+                } else {
+                    g_pre_bad = g_io_res.ch;
+                    g_pre_bad_at = brd_millis();
+                }
+            } else if (!g_io_res.text) {
+                g_pre_bad = g_io_res.ch;
+                g_pre_bad_at = brd_millis();
+            }
+            g_pre_ms = g_io_res.dur_us + ((uint32_t)brd_us() - lt0);
+            if (!ok) g_win_miss++;
+            free(g_io_res.text);
+            g_io_res.text = NULL;
+            g_pre_waiting = false;
+            reader_pending_resolve();
+        } else {
+            free(g_io_res.text);
+            g_io_res.text = NULL;
+        }
+    } else if (g_io_res.kind == IO_FLUSH) {
+        perf_add(PERF_STATE, g_io_res.dur_us, 0, 0);
+    } else if (g_io_res.kind == IO_SEARCH) {
+        if (g_search_active) {
+            g_nres = g_io_res.nres;
+            g_search_active = false;
+            g_search_enqueued = false;
+            g_res_scroll = 0;
+            g_search_none = g_nres == 0;
+            brd_cpu_freq(80);
+            if (g_nres > 0) g_scr = SCR_RESULTS;
+            g_force = true;   /* render results (or the "No results" screen) */
+        }
+    }
+    g_io_busy = false;
+#endif
+}
+
+static void io_wait_idle(void)
+{
+#ifdef HOST_GUI
+    return;
+#else
+    if (!g_io_ok) return;
+    for (int i = 0; i < 500; i++) {
+        io_worker_poll();
+        if (!g_io_busy && uxQueueMessagesWaiting(g_io_q) == 0 && !g_io_running) return;
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+#endif
+}
+
+static void search_poll(void)
+{
+    if (!g_search_active || g_search_enqueued) return;
+    if (io_enqueue_search(g_query)) g_search_enqueued = true;
+}
+
 static void search_run(void)
 {
     u_trim(g_query);
     if (!g_query[0] || !R.ep) return;
+    if (g_io_ok) {
+        g_nres = 0;
+        g_search_none = false;
+        g_search_active = true;
+        g_search_enqueued = false;
+        /* let an in-flight count finish, but do not enqueue new ones while
+           the search is pending: search goes first */
+        g_count_pause_until = brd_millis() + 5000;
+        ui_busy("Searching...");
+        brd_cpu_freq(240);   /* the worker inherits the clock while scanning */
+        search_poll();
+        return;
+    }
     size_t qlen = strlen(g_query);
     g_nres = 0;
     ui_busy("Searching...");
+    brd_cpu_freq(240);   /* full-book scan: finish quickly, then idle */
     int nch = epub_chapter_count(R.ep);
     for (int c = 0; c < nch && g_nres < 100; c++) {
         size_t tl = 0;
@@ -1643,6 +2437,7 @@ static void search_run(void)
         if (owned) free(t);
         brd_delay(1);
     }
+    brd_cpu_freq(80);
     g_res_scroll = 0;
     g_search_none = g_nres == 0;
     if (g_nres > 0) g_scr = SCR_RESULTS;
@@ -1667,7 +2462,7 @@ static void search_back_to_origin(void)
     if (R.page >= R.lay->npages) R.page = R.lay->npages - 1;
     R.bs.last_ch = R.chapter;
     R.bs.last_pg = R.page;
-    st_book_put(R.path, &R.bs);
+    reader_state_dirty();
     g_search_origin_valid = false;
     g_reader_full = false;
     g_scr = SCR_READER;
@@ -1724,6 +2519,7 @@ static void search_draw(void)
 
 static void search_input(int g, int x, int y)
 {
+    if (g_search_active) return;   /* worker still scanning */
     if (g != GEST_TAP) return;
     int W = brd_width(), H = brd_height();
     if (y > H - 40) { search_back_to_origin(); return; }
@@ -1733,7 +2529,11 @@ static void search_input(int g, int x, int y)
     bool changed = false;
     if (ch == '<') { if (len) { g_query[--len] = 0; changed = true; } }
     else if (ch == ' ') { if (len < 63) { g_query[len] = ' '; g_query[len + 1] = 0; changed = true; } }
-    else if (ch == '\n') { search_run(); g_force = true; return; }
+    else if (ch == '\n') {
+        search_run();
+        if (!g_search_active) g_force = true;   /* keep the busy band while the worker scans */
+        return;
+    }
     else if (len < 63) { g_query[len] = (char)ch; g_query[len + 1] = 0; changed = true; }
     if (changed) {
         g_search_none = false;
@@ -1784,7 +2584,7 @@ static void results_input(int g, int x, int y)
                 if (R.page < 0) R.page = 0;
                 if (R.page >= R.lay->npages) R.page = R.lay->npages - 1;
                 R.bs.last_ch = R.chapter; R.bs.last_pg = R.page;
-                st_book_put(R.path, &R.bs);
+                reader_state_dirty();
             }
             g_scr = SCR_READER; g_force = true; return;
         }
@@ -1843,7 +2643,7 @@ static void goto_input(int g, int x, int y)
     if (y > H - 40) { g_scr = SCR_READER; g_force = true; return; }
     if (furthest_ahead() && ui_hit(120, 495, 300, 40, x, y)) {
         R.bs.furthest_ch = R.chapter; R.bs.furthest_pg = R.page;
-        st_book_put(R.path, &R.bs); g_force = true; return;
+        reader_state_dirty(); g_force = true; return;
     }
     for (int k = 0; k < 12; k++) {
         int r = k / 3, c = k % 3;
@@ -1915,6 +2715,7 @@ static void usb_input(int g, int x, int y)
     if (g != GEST_TAP) return;
     if (!g_usb_active) {
         reader_state_flush();
+        io_wait_idle();
         batt_flush();
         st_save_cfg();
         int r = brd_usb_disk_start();
@@ -1937,7 +2738,7 @@ static void dev_start(int kind, int x0, int y0, int x1, int y1, int dur)
 {
     g_inj.kind = kind; g_inj.x0 = x0; g_inj.y0 = y0; g_inj.x1 = x1; g_inj.y1 = y1;
     g_inj.t0 = brd_millis(); g_inj.dur = (uint32_t)dur; g_inj.active = true; g_inj.pressed = false;
-    char lb[64]; snprintf(lb, sizeof(lb), "DBG inj start kind=%d %d,%d", kind, x0, y0); brd_log(lb);
+    APP_LOGD("DBG inj start");
 }
 
 static void dev_tick(void)
@@ -1951,7 +2752,7 @@ static void dev_tick(void)
     }
     if (g_inj.kind == 0) {
         if (el == 0) brd_dbg_touch(g_inj.x0, g_inj.y0, 1);
-        else if (el >= (uint32_t)g_inj.dur) { brd_dbg_touch(g_inj.x0, g_inj.y0, 3); g_inj.active = false; brd_log("DBG inj release"); }
+        else if (el >= (uint32_t)g_inj.dur) { brd_dbg_touch(g_inj.x0, g_inj.y0, 3); g_inj.active = false; APP_LOGD("DBG inj release"); }
         else brd_dbg_touch(g_inj.x0, g_inj.y0, 2);
     } else {
         uint32_t d = g_inj.dur ? g_inj.dur : 1;
@@ -2028,7 +2829,7 @@ static void dev_parse(char* s)
     if (!strncasecmp(s, "@TAP ", 5) && sscanf(s + 5, "%d %d", &a, &b) == 2) dev_start(0, a, b, a, b, 90);
     else if (!strncasecmp(s, "@SWIPE ", 7) && sscanf(s + 7, "%d %d %d %d", &a, &b, &c, &d) == 4) dev_start(1, a, b, c, d, 180);
     else if (!strncasecmp(s, "@HOLD ", 6) && sscanf(s + 6, "%d %d %d", &a, &b, &c) == 3) dev_start(0, a, b, a, b, c);
-    else if (!strncasecmp(s, "@SCREEN", 7)) brd_log(app_screen_name());
+    else if (!strncasecmp(s, "@SCREEN", 7)) brd_log_sync(app_screen_name());
     else if (!strncasecmp(s, "@SEARCH ", 8)) {
         snprintf(g_query, sizeof(g_query), "%s", s + 8);
         g_scr = SCR_SEARCH;
@@ -2037,8 +2838,10 @@ static void dev_parse(char* s)
     else if (!strncasecmp(s, "@SEARCHRUN ", 11)) {
         snprintf(g_query, sizeof(g_query), "%s", s + 11);
         search_run();
-        g_scr = g_nres > 0 ? SCR_RESULTS : SCR_SEARCH;
-        g_force = true;
+        if (!g_search_active) {
+            g_scr = g_nres > 0 ? SCR_RESULTS : SCR_SEARCH;
+            g_force = true;
+        }
     }
     else if (!strncasecmp(s, "@WIFIPASS", 9)) {
         g_wifi_field = 1; g_wifi_page = 0; g_wifi_state = 0;
@@ -2074,11 +2877,11 @@ static void dev_parse(char* s)
         snprintf(b, sizeof(b), "SD ok=%d sectors=%u secsize=%u size=%llu",
                  brd_sd_ok() ? 1 : 0, (unsigned)brd_sd_num_sectors(),
                  (unsigned)brd_sd_sector_size(), (unsigned long long)brd_sd_size());
-        brd_log(b);
+        brd_log_sync(b);
     }
     else if (!strncasecmp(s, "@USBSTART", 9)) {
         int r = brd_usb_disk_start();
-        char b[64]; snprintf(b, sizeof(b), "USBSTART r=%d", r); brd_log(b);
+        char b[64]; snprintf(b, sizeof(b), "USBSTART r=%d", r); brd_log_sync(b);
     }
     else if (!strncasecmp(s, "@BATT", 5)) {
         char b[192];
@@ -2087,9 +2890,35 @@ static void dev_parse(char* s)
                  brd_chg_stat_high() ? 1 : 0, brd_vbus_present() ? 1 : 0,
                  batt_hi_mv(), batt_lo_mv(), batt_sample_count(),
                  batt_is_full() ? 1 : 0, batt_is_low() ? 1 : 0);
-        brd_log(b);
+        brd_log_sync(b);
     }
-    else if (!strncasecmp(s, "@PERF RESET", 11)) { perf_reset(); brd_log("PERF reset"); }
+    else if (!strncasecmp(s, "@WIN", 4)) {
+        int cache_n = 0;
+        for (int i = 0; i < RC_N; i++) if (g_rc[i].ch >= 0) cache_n++;
+        int cov_a = R.lay ? coverage_pages(1) : 0;
+        int cov_b = R.lay ? coverage_pages(-1) : 0;
+        char b[256];
+        snprintf(b, sizeof(b),
+                 "WIN dir=%d streak=%d fast=%d cpu=%d cache=%d bytes=%u pre=%d pend=%d/%d miss=%lu cov=%d/%d pms=%lu ch=%d/%d",
+                 g_fast_dir, g_turn_streak, g_fast_dir != 0 ? 1 : 0,
+                 brd_cpu_freq(0), cache_n, (unsigned)g_rc_bytes,
+                 g_pre_waiting ? 1 : 0, g_pending_dir, g_pending_steps,
+                 (unsigned long)g_win_miss, cov_a, cov_b,
+                 (unsigned long)(g_pre_ms / 1000u),
+                 R.ep ? R.chapter : -1, R.ep ? epub_chapter_count(R.ep) : 0);
+        brd_log_sync(b);
+    }
+    else if (!strncasecmp(s, "@SLEEP", 6)) {
+        brd_ls_stats_t st;
+        brd_idle_stats(&st);
+        char b[192];
+        snprintf(b, sizeof(b), "LS entries=%lu timer=%lu touch=%lu other=%lu skipped=%lu idle_ok=%d",
+                 (unsigned long)st.entries, (unsigned long)st.timer,
+                 (unsigned long)st.touch, (unsigned long)st.other,
+                 (unsigned long)st.skipped, app_can_deep_idle() ? 1 : 0);
+        brd_log_sync(b);
+    }
+    else if (!strncasecmp(s, "@PERF RESET", 11)) { perf_reset(); brd_log_sync("PERF reset"); }
     else if (!strncasecmp(s, "@PERF", 5)) perf_dump();
     else if (!strncasecmp(s, "@STATE", 6)) {
         BookState b; char sp[256];
@@ -2099,13 +2928,13 @@ static void dev_parse(char* s)
             char msg[192];
             snprintf(msg, sizeof(msg), "STATE file=%s font=%d last=%d/%d furthest=%d/%d bm=%d", sp,
                      g_cfg.rd_font, b.last_ch, b.last_pg, b.furthest_ch, b.furthest_pg, b.bm_count);
-            brd_log(msg);
-        } else brd_log("STATE no book");
+            brd_log_sync(msg);
+        } else brd_log_sync("STATE no book");
     }
     else if (!strncasecmp(s, "@SHOT1", 6)) dev_send_shot1();
     else if (!strncasecmp(s, "@ALARMTEST", 10)) alarm_test_now();
     else if (!strncasecmp(s, "@SHOT", 5)) dev_send_shot();
-    else if (!strncasecmp(s, "@PING", 5)) brd_log("PONG");
+    else if (!strncasecmp(s, "@PING", 5)) brd_log_sync("PONG");
 }
 
 static void dev_poll(void)
@@ -2127,7 +2956,7 @@ static void dev_poll(void)
 #endif
 
 // ---------------------------------------------------------------- app
-static uint32_t g_last_input;
+static bool g_idle_ok;      /* light sleep allowed at the next idle boundary */
 static bool g_alarm_ring;
 static int  g_alarm_min = -1;
 static uint32_t g_alarm_beep_ms;
@@ -2142,7 +2971,7 @@ static void alarm_test_now(void)
     g_alarm_min = -1;
     g_alarm_ring = false;
     st_save_cfg();
-    brd_log("alarm test set to current minute");
+    APP_LOGD("alarm test set to current minute");
 }
 
 void app_setup(void)
@@ -2150,7 +2979,9 @@ void app_setup(void)
     brd_serial_begin();
     brd_begin(false);
     brd_sd_mount();
+    u_sd_lock_init();
     st_init();
+    rc_clear();   /* cache entries start as empty (ch = -1) */
     theme_init();
     g_cfg.orientation = g_cfg.flip ? 2 : 0;
     brd_rotation(g_cfg.orientation);
@@ -2165,6 +2996,7 @@ void app_setup(void)
     boot_screen_draw();
     brd_delay(1500);
     library_scan();
+    io_worker_init();   /* core-0 SD/EPUB worker (starts idle) */
     brd_cpu_freq(80);
     g_scr = SCR_LIBRARY;
     g_force = true;
@@ -2176,6 +3008,9 @@ int app_loop(void)
 #ifdef DEV_INJECT
     dev_poll();
 #endif
+    io_worker_poll();   /* page counts / prefetch / search results from core 0 */
+    search_poll();      /* retry a search queued while the bus was busy */
+    reader_window_step();   /* rolling window has priority over background count */
     book_count_step();
     brd_touch_t t;
     brd_touch_poll(&t);
@@ -2189,7 +3024,7 @@ int app_loop(void)
         if (x0 == 0 && y0 == 0) { x0 = t.x; y0 = t.y; }
         int dx = t.x - x0, dy = t.y - y0;
         int adx = dx < 0 ? -dx : dx, ady = dy < 0 ? -dy : dy;
-        brd_log("DBG touch release");
+        APP_LOGD("DBG touch release");
         if (adx > 70 && adx > ady) g = dx > 0 ? GEST_SWIPE_RIGHT : GEST_SWIPE_LEFT;
         else if (ady > 70 && ady > adx) g = dy > 0 ? GEST_SWIPE_DOWN : GEST_SWIPE_UP;
         else g = GEST_TAP;
@@ -2223,13 +3058,11 @@ int app_loop(void)
             g_force = true;
         }
     } else if (g) {
-        {
-            char dbg[96];
-            snprintf(dbg, sizeof(dbg), "DBG gesture=%d %d,%d screen=%d", g, gx, gy, (int)g_scr);
-            brd_log(dbg);
-        }
+        APP_LOGD("DBG gesture");
         g_last_input = brd_millis();
-        g_count_pause_until = brd_millis() + 250;
+        /* keep the SD bus free while the user is turning pages: the
+           background count resumes on the next quiet second */
+        g_count_pause_until = brd_millis() + 1000;
         g_evt_kind = 0;
         if (g_scr == SCR_READER) {
             if (g == GEST_TAP && gy >= 36 &&
@@ -2253,13 +3086,9 @@ int app_loop(void)
                         g_goto_len = 0; g_scr = SCR_GOTO; g_force = true;
                     } else { g_scr = SCR_CHAPTERS; g_force = true; }
                 } else if (gx < brd_width() / 4) {
-                    if (R.page > 0) R.page--;
-                    else if (R.chapter > 0) { if (reader_load_chapter(R.chapter - 1)) R.page = R.lay->npages - 1; }
-                    reader_progress(); g_force = true;
+                    reader_turn(-1);
                 } else if (gx > brd_width() * 3 / 4) {
-                    if (R.page + 1 < R.lay->npages) R.page++;
-                    else if (R.chapter + 1 < epub_chapter_count(R.ep)) { if (reader_load_chapter(R.chapter + 1)) R.page = 0; }
-                    reader_progress(); g_force = true;
+                    reader_turn(1);
                 }
             }
             break;
@@ -2333,8 +3162,13 @@ int app_loop(void)
     if (g_cfg.auto_off_min > 0 && (uint32_t)(now - g_last_input) > (uint32_t)g_cfg.auto_off_min * 60000u) {
         poweroff_now();
     }
-    if (g_state_dirty && (uint32_t)(now - g_state_dirty_at) >= 2500u)
-        reader_state_flush();
+    if (g_state_dirty && (uint32_t)(now - g_state_dirty_at) >= 2500u) {
+        if (g_io_ok) {
+            if (io_enqueue_flush(R.path, &R.bs)) g_state_dirty = false;
+        } else {
+            reader_state_flush();
+        }
+    }
     if (R.ep && g_scr == SCR_READER && g_partial_count >= 10 &&
         (uint32_t)(now - g_last_input) > 12000u &&
         (uint32_t)(now - g_last_ghost_ms) > 30000u) {
@@ -2342,11 +3176,40 @@ int app_loop(void)
         g_partial_count = 0;
         g_last_ghost_ms = now;
     }
-    brd_cpu_freq(80);
-    return 30;
+    if (g_pending_dir && (uint32_t)(now - g_pending_at) > 3000u) {
+        /* the worker did not fill the neighbour in time: drop the queued
+           turn instead of touching SD inside the tap path. The miss was
+           already counted when the pending turn was created. */
+        g_pending_dir = 0;
+        g_pending_steps = 0;
+        g_force = true;
+    }
+    if ((uint32_t)(now - g_last_input) > 3000u) {
+        /* the reader has calmed down: back to 80 MHz, symmetric window and
+           a fresh six-flip counter */
+        g_fast_dir = 0;
+        g_turn_streak = 0;
+        g_turn_dir = 0;
+    }
+    /* a search owns the bus: keep the 240 MHz boost the worker inherits
+       until it completes (io_worker_poll lowers it on the result) */
+    brd_cpu_freq((g_fast_dir || g_search_active) ? 240 : 80);
+#if OPT_LIGHT_SLEEP
+    /* Light sleep is safe only when the UI has nothing pending and no
+       background I/O/EPD work is in flight. Touch (GT911 INT on GPIO48)
+       wakes the SoC immediately; the timer only bounds power-key/clock
+       latency, so the idle interval can be much longer than 30 ms. */
+    g_idle_ok = !g_count_active && !g_force &&
+                g_scr != SCR_USB && g_scr != SCR_WIFI && g_scr != SCR_SEARCH &&
+                !brd_vbus_present() &&   /* USB CDC does not survive light sleep */
+                !brd_display_busy() && !brd_wifi_active() && !brd_bt_active();
+#else
+    g_idle_ok = false;
+#endif
+    return g_idle_ok ? 250 : 30;
 }
 
-bool app_can_deep_idle(void) { return false; }
+bool app_can_deep_idle(void) { return g_idle_ok; }
 
 const char* app_screen_name(void)
 {

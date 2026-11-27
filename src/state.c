@@ -34,6 +34,7 @@ static void cfg_defaults(void)
 
 void st_load_cfg(void)
 {
+    u_sd_lock();
     cfg_defaults();
     g_cfg.dark_mode        = u_file_read_int(ST_DARK_MODE, 1) != 0;
     g_cfg.images           = u_file_read_int(ST_IMAGES, 1) != 0;
@@ -85,11 +86,13 @@ void st_load_cfg(void)
 
     g_saved = g_cfg;
     g_saved_init = true;
+    u_sd_unlock();
 }
 
 void st_save_cfg(void)
 {
     if (g_saved_init && memcmp(&g_cfg, &g_saved, sizeof(g_cfg)) == 0) return;
+    u_sd_lock();
     bool full = !g_saved_init;
 
     if (full || g_cfg.dark_mode      != g_saved.dark_mode)      u_file_write_int(ST_DARK_MODE, g_cfg.dark_mode);
@@ -130,6 +133,7 @@ void st_save_cfg(void)
 
     g_saved = g_cfg;
     g_saved_init = true;
+    u_sd_unlock();
 }
 
 int st_init(void)
@@ -181,12 +185,8 @@ static void bs_sanitize(BookState* st)
     }
 }
 
-static int g_st_gets = 0;
-int st_book_get_count(void) { return g_st_gets; }
-
-int st_book_get(const char* bookpath, BookState* st)
+static int st_book_get_locked(const char* bookpath, BookState* st)
 {
-    g_st_gets++;
     memset(st, 0, sizeof(*st));
     st->magic = BOOKSTATE_MAGIC;
     st->last_off = -1;
@@ -230,106 +230,27 @@ int st_book_get(const char* bookpath, BookState* st)
     return -1;
 }
 
+int st_book_get(const char* bookpath, BookState* st)
+{
+    u_sd_lock();
+    int r = st_book_get_locked(bookpath, st);
+    u_sd_unlock();
+    return r;
+}
+
 void st_book_put(const char* bookpath, const BookState* st)
 {
+    u_sd_lock();
     char path[256];
     st_book_path(bookpath, path, sizeof(path));
     BookStateFile out;
     memcpy(&out.bs, st, sizeof(*st));
     out.crc = u_crc32(st, sizeof(*st));
     u_file_write_atomic(path, &out, sizeof(out));
+    u_sd_unlock();
 }
 
-int st_total_books_progress(void)
-{
-    return -1; /* reserved: aggregate progress across library */
-}
-
-// ------------------------------------------------------------------ wifi nets
-#define WIFI_MAGIC 0x4C595357   /* "LYSW" */
-typedef struct { char ssid[33]; char pass[65]; } NetCred;
-typedef struct {
-    int32_t magic;
-    int32_t count;
-    NetCred nets[WNET_MAX];
-} NetTable;
-
-static NetTable g_nets;
-static bool g_nets_loaded = false;
-
-static void nets_load(void)
-{
-    if (g_nets_loaded) return;
-    g_nets_loaded = true;
-    memset(&g_nets, 0, sizeof(g_nets));
-    FILE* f = fopen(ST_WIFI, "rb");
-    if (!f) return;
-    NetTable tmp;
-    size_t rd = fread(&tmp, 1, sizeof(tmp), f);
-    fclose(f);
-    if (rd == sizeof(tmp) && tmp.magic == WIFI_MAGIC) {
-        if (tmp.count < 0) tmp.count = 0;
-        if (tmp.count > WNET_MAX) tmp.count = WNET_MAX;
-        for (int i = 0; i < WNET_MAX; i++) { tmp.nets[i].ssid[32] = 0; tmp.nets[i].pass[64] = 0; }
-        g_nets = tmp;
-    }
-}
-
-static void nets_save(void)
-{
-    g_nets.magic = WIFI_MAGIC;
-    u_file_write_atomic(ST_WIFI, &g_nets, sizeof(g_nets));
-}
-
-void st_wifi_save(const char* ssid, const char* pass)
-{
-    if (!ssid || !ssid[0]) return;
-    nets_load();
-    int idx = -1;
-    for (int i = 0; i < g_nets.count; i++) {
-        if (strcmp(g_nets.nets[i].ssid, ssid) == 0) { idx = i; break; }
-    }
-    if (idx < 0) {
-        int keep = g_nets.count >= WNET_MAX ? WNET_MAX - 1 : g_nets.count;
-        memmove(&g_nets.nets[1], &g_nets.nets[0], sizeof(NetCred) * keep);
-        if (g_nets.count < WNET_MAX) g_nets.count++;
-        idx = 0;
-    } else if (idx > 0) {
-        NetCred tmp = g_nets.nets[idx];
-        memmove(&g_nets.nets[1], &g_nets.nets[0], sizeof(NetCred) * idx);
-        g_nets.nets[0] = tmp;
-        idx = 0;
-    }
-    snprintf(g_nets.nets[idx].ssid, sizeof(g_nets.nets[idx].ssid), "%s", ssid);
-    snprintf(g_nets.nets[idx].pass, sizeof(g_nets.nets[idx].pass), "%s", pass ? pass : "");
-    nets_save();
-}
-
-const char* st_wifi_find(const char* ssid)
-{
-    if (!ssid || !ssid[0]) return NULL;
-    nets_load();
-    for (int i = 0; i < g_nets.count; i++) {
-        if (strcmp(g_nets.nets[i].ssid, ssid) == 0) return g_nets.nets[i].pass;
-    }
-    return NULL;
-}
-
-int st_wifi_count(void)
-{
-    nets_load();
-    return g_nets.count;
-}
-
-int st_wifi_get(int i, char* ssid, int sslen, char* pass, int palen)
-{
-    nets_load();
-    if (i < 0 || i >= g_nets.count) return -1;
-    if (ssid && sslen > 0) snprintf(ssid, sslen, "%s", g_nets.nets[i].ssid);
-    if (pass && palen > 0) snprintf(pass, palen, "%s", g_nets.nets[i].pass);
-    return 0;
-}
-
+// ------------------------------------------------------------------ wifi fast cache
 /* W1: fast-connect cache (magic LYSF + crc32(ssid) + bssid + channel + crc) */
 #define WIFI_FAST_MAGIC 0x4C595346   /* "LYSF" */
 typedef struct {
@@ -344,10 +265,12 @@ bool st_wifi_fast_get(const char* ssid, uint8_t bssid_out[6], int* channel_out)
 {
     if (!ssid || !ssid[0]) return false;
     WifiFastFile f;
+    u_sd_lock();
     FILE* fp = fopen(ST_WIFI_FAST, "rb");
-    if (!fp) return false;
+    if (!fp) { u_sd_unlock(); return false; }
     size_t rd = fread(&f, 1, sizeof(f), fp);
     fclose(fp);
+    u_sd_unlock();
     if (rd != sizeof(f) || f.magic != WIFI_FAST_MAGIC) return false;
     if (f.crc != u_crc32(&f, sizeof(f) - sizeof(f.crc))) return false;
     if (f.ssid_crc != u_crc32(ssid, strlen(ssid))) return false;

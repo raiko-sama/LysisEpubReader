@@ -14,7 +14,7 @@
 #ifndef PG_NO_WIDTH_CACHE
 /* width cache: measuring a word through the font engine is expensive on
    the target; chapters repeat the same words a lot. */
-#define WIDTH_CACHE 1024
+#define WIDTH_CACHE 2048
 typedef struct { uint32_t key; int16_t width; } wc_entry_t;
 static wc_entry_t g_wc[WIDTH_CACHE];
 
@@ -209,9 +209,4 @@ int pg_page_of_offset(const Layout* l, size_t off)
     return lo > 0 ? lo - 1 : 0;
 }
 
-void pg_width_cache_reset(void)
-{
-#ifndef PG_NO_WIDTH_CACHE
-    memset(g_wc, 0, sizeof(g_wc));
-#endif
-}
+

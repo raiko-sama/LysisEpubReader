@@ -14,6 +14,31 @@
 #include "esp_rom_crc.h"
 #endif
 
+#if defined(ESP32) && !defined(HOST_GUI)
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+static SemaphoreHandle_t s_sd_mtx = NULL;
+
+void u_sd_lock_init(void)
+{
+    if (!s_sd_mtx) s_sd_mtx = xSemaphoreCreateRecursiveMutex();
+}
+
+void u_sd_lock(void)
+{
+    if (s_sd_mtx) xSemaphoreTakeRecursive(s_sd_mtx, portMAX_DELAY);
+}
+
+void u_sd_unlock(void)
+{
+    if (s_sd_mtx) xSemaphoreGiveRecursive(s_sd_mtx);
+}
+#else
+void u_sd_lock_init(void) {}
+void u_sd_lock(void) {}
+void u_sd_unlock(void) {}
+#endif
+
 void* u_alloc(size_t n)
 {
     void* p = ps_malloc(n);
@@ -30,76 +55,46 @@ void* u_calloc(size_t n, size_t sz)
     return p;
 }
 
-char* u_strdup(const char* s)
-{
-    if (!s) return NULL;
-    size_t n = strlen(s) + 1;
-    char* p = (char*)u_alloc(n);
-    if (p) memcpy(p, s, n);
-    return p;
-}
-
-char* u_strndup(const char* s, size_t n)
-{
-    size_t len = strnlen(s, n);
-    char* p = (char*)u_alloc(len + 1);
-    if (p) { memcpy(p, s, len); p[len] = 0; }
-    return p;
-}
-
-int u_file_read(const char* path, void** buf, size_t* len)
-{
-    *buf = NULL; if (len) *len = 0;
-    FILE* f = fopen(path, "rb");
-    if (!f) return -1;
-    fseek(f, 0, SEEK_END);
-    long sz = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    if (sz < 0) { fclose(f); return -1; }
-    void* p = u_alloc((size_t)sz + 1);
-    if (!p) { fclose(f); return -1; }
-    size_t rd = fread(p, 1, (size_t)sz, f);
-    fclose(f);
-    ((char*)p)[rd] = 0;
-    *buf = p;
-    if (len) *len = rd;
-    return 0;
-}
-
 int u_write_count = 0;
 
 int u_file_write(const char* path, const void* buf, size_t len)
 {
+    u_sd_lock();
     FILE* f = fopen(path, "wb");
-    if (!f) return -1;
+    if (!f) { u_sd_unlock(); return -1; }
     size_t wr = fwrite(buf, 1, len, f);
     fclose(f);
     u_write_count++;
+    u_sd_unlock();
     return wr == len ? 0 : -1;
 }
 
 int u_file_write_atomic(const char* path, const void* buf, size_t len)
 {
+    u_sd_lock();
     char tmp[288];
-    if (snprintf(tmp, sizeof(tmp), "%s.tmp", path) >= (int)sizeof(tmp)) return -1;
+    if (snprintf(tmp, sizeof(tmp), "%s.tmp", path) >= (int)sizeof(tmp)) { u_sd_unlock(); return -1; }
     FILE* f = fopen(tmp, "wb");
-    if (!f) return -1;
+    if (!f) { u_sd_unlock(); return -1; }
     size_t wr = fwrite(buf, 1, len, f);
     fclose(f);
-    if (wr != len) { remove(tmp); return -1; }
+    if (wr != len) { remove(tmp); u_sd_unlock(); return -1; }
     remove(path);   /* FATFS/win32 rename() cannot reliably overwrite */
-    if (rename(tmp, path) != 0) { remove(tmp); return -1; }
+    if (rename(tmp, path) != 0) { remove(tmp); u_sd_unlock(); return -1; }
     u_write_count++;
+    u_sd_unlock();
     return 0;
 }
 
 int u_file_read_int(const char* path, int def)
 {
+    u_sd_lock();
     FILE* f = fopen(path, "rb");
-    if (!f) return def;
+    if (!f) { u_sd_unlock(); return def; }
     int v = def;
     fread(&v, sizeof(v), 1, f);
     fclose(f);
+    u_sd_unlock();
     return v;
 }
 
@@ -110,86 +105,27 @@ int u_file_write_int(const char* path, int v)
 
 int64_t u_file_read_i64(const char* path, int64_t def)
 {
+    u_sd_lock();
     FILE* f = fopen(path, "rb");
-    if (!f) return def;
+    if (!f) { u_sd_unlock(); return def; }
     int64_t v = def;
     fread(&v, sizeof(v), 1, f);
     fclose(f);
+    u_sd_unlock();
     return v;
-}
-
-int u_file_write_i64(const char* path, int64_t v)
-{
-    return u_file_write(path, &v, sizeof(v));
 }
 
 int u_file_read_str(const char* path, char* out, int outlen)
 {
+    u_sd_lock();
     out[0] = 0;
     FILE* f = fopen(path, "rb");
-    if (!f) return -1;
+    if (!f) { u_sd_unlock(); return -1; }
     int n = (int)fread(out, 1, outlen - 1, f);
     out[n > 0 ? n : 0] = 0;
     fclose(f);
+    u_sd_unlock();
     return 0;
-}
-
-int u_file_write_str(const char* path, const char* s)
-{
-    return u_file_write(path, s, strlen(s));
-}
-
-bool u_file_exists(const char* path)
-{
-    FILE* f = fopen(path, "rb");
-    if (!f) return false;
-    fclose(f);
-    return true;
-}
-
-/* buffered diagnostic log mirror (one SD append per batch) */
-#define U_BLOG_MAX 4096
-static char     u_blog_buf[U_BLOG_MAX];
-static int      u_blog_len = 0;
-static int      u_blog_lines = 0;
-static uint32_t u_blog_first = 0;
-
-static void u_blog_flush_to(const char* path)
-{
-    if (!path || u_blog_len <= 0) return;
-    FILE* f = fopen(path, "ab");
-    if (f) {
-        fwrite(u_blog_buf, 1, (size_t)u_blog_len, f);
-        fclose(f);
-    }
-    u_blog_len = 0;
-    u_blog_lines = 0;
-    u_write_count++;   /* SD write instrumentation */
-}
-
-void u_blog_append(const char* path, const char* line, uint32_t now_ms)
-{
-    if (!path || !line) return;
-    size_t n = strlen(line);
-    if (u_blog_lines > 0 &&
-        (u_blog_len + (int)n + 2 > U_BLOG_MAX || u_blog_lines >= 10 ||
-         (uint32_t)(now_ms - u_blog_first) >= 30000u)) {
-        u_blog_flush_to(path);
-    }
-    if (u_blog_lines == 0) {
-        u_blog_first = now_ms;
-        u_blog_len = 0;
-    }
-    if (u_blog_len + (int)n + 2 > U_BLOG_MAX) return;   /* overlong line dropped */
-    memcpy(u_blog_buf + u_blog_len, line, n);
-    u_blog_len += (int)n;
-    u_blog_buf[u_blog_len++] = '\n';
-    u_blog_lines++;
-}
-
-void u_blog_flush(const char* path)
-{
-    u_blog_flush_to(path);
 }
 
 void u_mkdirs(const char* path)
@@ -212,16 +148,6 @@ void u_mkdirs(const char* path)
 #else
     mkdir(tmp, 0777);
 #endif
-}
-
-void u_path_dir(const char* path, char* out, int outlen)
-{
-    const char* s = strrchr(path, '/');
-    if (!s) { snprintf(out, outlen, "."); return; }
-    int n = (int)(s - path);
-    if (n >= outlen) n = outlen - 1;
-    memcpy(out, path, n);
-    out[n] = 0;
 }
 
 void u_path_join(char* out, int outlen, const char* a, const char* b)
@@ -288,51 +214,6 @@ void u_trim(char* s)
     if (p != s) memmove(s, p, strlen(p) + 1);
     size_t n = strlen(s);
     while (n && (s[n - 1] == ' ' || s[n - 1] == '\t' || s[n - 1] == '\r' || s[n - 1] == '\n')) s[--n] = 0;
-}
-
-// Minimal UTF-8 -> ASCII folding for the fonts shipped with M5GFX.
-void u_ascii_fold(char* s)
-{
-    unsigned char* p = (unsigned char*)s;
-    unsigned char* o = p;
-    while (*p) {
-        unsigned char c = *p;
-        if (c >= 0xC0) {
-            // map common 2-byte sequences
-            if (p[1]) {
-                unsigned cp = ((c & 0x1F) << 6) | (p[1] & 0x3F);
-                char rep = '?';
-                if (cp >= 0xC0 && cp <= 0xC5) rep = 'A';
-                else if (cp == 0xC7) rep = 'C';
-                else if (cp >= 0xC8 && cp <= 0xCB) rep = 'E';
-                else if (cp >= 0xCC && cp <= 0xCF) rep = 'I';
-                else if (cp == 0xD1) rep = 'N';
-                else if (cp >= 0xD2 && cp <= 0xD6) rep = 'O';
-                else if (cp == 0xD8) rep = 'O';
-                else if (cp >= 0xD9 && cp <= 0xDC) rep = 'U';
-                else if (cp == 0xDD) rep = 'Y';
-                else if (cp >= 0xE0 && cp <= 0xE5) rep = 'a';
-                else if (cp == 0xE7) rep = 'c';
-                else if (cp >= 0xE8 && cp <= 0xEB) rep = 'e';
-                else if (cp >= 0xEC && cp <= 0xEF) rep = 'i';
-                else if (cp == 0xF1) rep = 'n';
-                else if (cp >= 0xF2 && cp <= 0xF6) rep = 'o';
-                else if (cp == 0xF8) rep = 'o';
-                else if (cp >= 0xF9 && cp <= 0xFC) rep = 'u';
-                else if (cp == 0xFD || cp == 0xFF) rep = 'y';
-                else if (cp >= 0x2018 && cp <= 0x201F) rep = '\'';
-                else if (cp == 0x2013 || cp == 0x2014) rep = '-';
-                else if (cp == 0x2026) rep = '.';
-                else if (cp == 0x00A0) rep = ' ';
-                else if (cp == 0x00AB || cp == 0x00BB) rep = '"';
-                *o++ = rep;
-                p += 2;
-                continue;
-            }
-        }
-        *o++ = *p++;
-    }
-    *o = 0;
 }
 
 void u_clip_rect(int* x, int* y, int* w, int* h, int maxw, int maxh)

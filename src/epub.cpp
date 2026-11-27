@@ -49,9 +49,7 @@ struct Epub {
     std::string cover_href;
     std::string nav_href;   /* EPUB3 toc document */
     std::vector<std::pair<std::string, std::string>> manifest; // id -> resolved href
-    std::vector<uint8_t> scratch;   /* reusable extraction buffer (grow-only) */
     std::vector<std::pair<std::string, int>> zip_cache; /* name -> index */
-    int lookup_misses = 0;          /* instrumentation: central directory scans */
 };
 
 // ---------------------------------------------------------------- helpers
@@ -126,7 +124,6 @@ static int zip_find_index(Epub* e, const std::string& name)
     };
     auto pos = std::lower_bound(e->zip_cache.begin(), e->zip_cache.end(), name, cmp);
     if (pos != e->zip_cache.end() && pos->first == name) return pos->second;
-    e->lookup_misses++;
     int idx = mz_zip_reader_locate_file(&e->zip, name.c_str(), nullptr, 0);
     if (idx < 0) {
         // case-insensitive fallback (exact length match only)
@@ -204,14 +201,27 @@ static bool zip_read(Epub* e, const std::string& name, std::string& out, size_t 
     return true;
 }
 
-static char* dup_psram(const std::string& s, size_t* out_len)
+/* Extract one entry straight into a PSRAM (heap fallback) buffer: images are
+   copied exactly once instead of std::string + duplicate. */
+static char* zip_extract_psram(Epub* e, const std::string& name, size_t max_uncomp, size_t* out_len)
 {
-    char* p = (char*)ps_malloc(s.size() + 1);
-    if (!p) p = (char*)malloc(s.size() + 1);
+    if (!e) return nullptr;
+    int idx = zip_find_index(e, name);
+    if (idx < 0) return nullptr;
+    mz_zip_archive_file_stat st;
+    if (!mz_zip_reader_file_stat(&e->zip, (mz_uint)idx, &st)) return nullptr;
+    size_t need = (size_t)st.m_uncomp_size;
+    if (!need) return nullptr;
+    if (max_uncomp && need > max_uncomp) return nullptr;
+#if OPT_ZIP_GUARD
+    if (st.m_comp_size > 0 && need / st.m_comp_size > ZIP_MAX_RATIO) return nullptr;
+#endif
+    char* p = (char*)ps_malloc(need + 1);
+    if (!p) p = (char*)malloc(need + 1);
     if (!p) return nullptr;
-    memcpy(p, s.data(), s.size());
-    p[s.size()] = 0;
-    if (out_len) *out_len = s.size();
+    if (!mz_zip_reader_extract_to_mem(&e->zip, (mz_uint)idx, p, need, 0)) { free(p); return nullptr; }
+    p[need] = 0;
+    if (out_len) *out_len = need;
     return p;
 }
 
@@ -431,12 +441,13 @@ static bool parse_opf(Epub* e, const std::string& opf_path)
 
 extern "C" Epub* epub_open(const char* path)
 {
+    u_sd_lock();
     Epub* e = new Epub();
     e->is_open = false;
     e->path = path;
     EPUB_DIAG("epub: zip init: %s", path);
     EPUB_STACK();
-    if (!mz_zip_reader_init_file(&e->zip, path, 0)) { delete e; return nullptr; }
+    if (!mz_zip_reader_init_file(&e->zip, path, 0)) { delete e; u_sd_unlock(); return nullptr; }
     e->is_open = true;
     EPUB_DIAG("epub: zip init OK (files=%d)", (int)mz_zip_reader_get_num_files(&e->zip));
     EPUB_STACK();
@@ -446,18 +457,22 @@ extern "C" Epub* epub_open(const char* path)
         EPUB_DIAG("epub: open FAILED (container/opf)");
         mz_zip_reader_end(&e->zip);
         delete e;
+        u_sd_unlock();
         return nullptr;
     }
     EPUB_DIAG("epub: open OK (ch=%d)", (int)e->ch.size());
     EPUB_STACK();
+    u_sd_unlock();
     return e;
 }
 
 extern "C" void epub_close(Epub* e)
 {
     if (!e) return;
+    u_sd_lock();
     if (e->is_open) mz_zip_reader_end(&e->zip);
     delete e;
+    u_sd_unlock();
 }
 
 extern "C" const char* epub_title(Epub* e) { return e ? e->title.c_str() : ""; }
@@ -468,66 +483,56 @@ extern "C" const char* epub_chapter_title(Epub* e, int i)
     if (!e || i < 0 || i >= (int)e->ch.size()) return "";
     return e->ch[i].title.c_str();
 }
-extern "C" const char* epub_chapter_href(Epub* e, int i)
-{
-    if (!e || i < 0 || i >= (int)e->ch.size()) return "";
-    return e->ch[i].href.c_str();
-}
-extern "C" const char* epub_cover_href(Epub* e) { return e ? e->cover_href.c_str() : ""; }
-
 extern "C" char* epub_chapter_text(Epub* e, int i, size_t* out_len)
 {
     if (!e || i < 0 || i >= (int)e->ch.size()) return nullptr;
     std::string html;
-    if (!zip_read(e, e->ch[i].href, html, ZIP_MAX_CHAPTER)) return nullptr;
+    u_sd_lock();
+    bool ok = zip_read(e, e->ch[i].href, html, ZIP_MAX_CHAPTER);
+    /* the HTML fold is pure CPU: release the SD lock before running it */
+    u_sd_unlock();
+    if (!ok) return nullptr;
     return ht_to_text(html.c_str(), html.size(), out_len);
-}
-
-extern "C" char* epub_entry_extract(Epub* e, const char* name, size_t* out_len)
-{
-    if (!e) return nullptr;
-    std::string data;
-    if (!zip_read(e, normalize(e->opf_dir, percent_decode(name)), data, ZIP_MAX_IMAGE)) return nullptr;
-    return dup_psram(data, out_len);
 }
 
 extern "C" char* epub_image(Epub* e, const char* href, size_t* out_len)
 {
     if (!e || !href) return nullptr;
-    std::string data;
-    std::string resolved = normalize(e->opf_dir, percent_decode(href));
-    if (!zip_read(e, resolved, data, ZIP_MAX_IMAGE)) return nullptr;
-    return dup_psram(data, out_len);
+    u_sd_lock();
+    char* p = zip_extract_psram(e, normalize(e->opf_dir, percent_decode(href)), ZIP_MAX_IMAGE, out_len);
+    u_sd_unlock();
+    return p;
 }
 
 extern "C" char* epub_image_from(Epub* e, int chapter, const char* href, size_t* out_len)
 {
     if (!e || !href || chapter < 0 || chapter >= (int)e->ch.size()) return nullptr;
+    u_sd_lock();
     std::string ch_href = e->ch[chapter].href;
     size_t slash = ch_href.rfind('/');
     std::string ch_dir = (slash == std::string::npos) ? std::string() : ch_href.substr(0, slash);
-    std::string data;
-    std::string resolved = normalize(ch_dir, percent_decode(href));
-    if (!zip_read(e, resolved, data, ZIP_MAX_IMAGE)) return nullptr;
-    return dup_psram(data, out_len);
+    char* p = zip_extract_psram(e, normalize(ch_dir, percent_decode(href)), ZIP_MAX_IMAGE, out_len);
+    u_sd_unlock();
+    return p;
 }
 
 extern "C" char* epub_cover(Epub* e, size_t* out_len)
 {
     if (!e || e->cover_href.empty()) return nullptr;
-    std::string data;
-    if (!zip_read(e, e->cover_href, data, ZIP_MAX_IMAGE)) return nullptr;
-    if (!data.empty() && data[0] == '<') {
-        std::string href = svg_image_href(data);
+    u_sd_lock();
+    size_t len = 0;
+    char* data = zip_extract_psram(e, e->cover_href, ZIP_MAX_IMAGE, &len);
+    if (!data) { u_sd_unlock(); return nullptr; }
+    if (len && data[0] == '<') {
+        std::string href = svg_image_href(std::string(data));
         if (!href.empty() && href.rfind("data:", 0) != 0) {
             size_t slash = e->cover_href.rfind('/');
             std::string dir = (slash == std::string::npos) ? std::string() : e->cover_href.substr(0, slash);
-            std::string resolved = normalize(dir, percent_decode(href));
-            std::string inner;
-            if (zip_read(e, resolved, inner, ZIP_MAX_IMAGE)) data.swap(inner);
+            char* inner = zip_extract_psram(e, normalize(dir, percent_decode(href)), ZIP_MAX_IMAGE, &len);
+            if (inner) { free(data); data = inner; }
         }
     }
-    return dup_psram(data, out_len);
+    if (out_len) *out_len = len;
+    u_sd_unlock();
+    return data;
 }
-
-extern "C" int epub_lookup_misses(Epub* e) { return e ? e->lookup_misses : 0; }

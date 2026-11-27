@@ -75,6 +75,7 @@ static int  g_med_n = 0;
 static int  g_med_i = 0;
 static int  g_last_mv = -1;
 static int  g_soc = -1;         /* monotonic displayed percentage */
+static int  g_pct_cache = -1;   /* memoized median, invalidated per sample */
 static int  g_stable = 0;
 static bool g_full = false;
 static bool g_low = false;
@@ -112,6 +113,7 @@ static int pct_from_mv(int mv)
 static void write_log_batch(void)
 {
     if (g_blog_n <= 0) return;
+    u_sd_lock();
 
     FILE* f = fopen(ST_BAT_LOG, "ab");
     if (f) {
@@ -135,18 +137,21 @@ static void write_log_batch(void)
         }
         fclose(f);
     }
+    u_sd_unlock();
     g_blog_n = 0;
 }
 
 static void load(void)
 {
     memset(&g_b, 0, sizeof(g_b));
+    u_sd_lock();
     FILE* f = fopen(ST_BAT_CYCLE, "rb");
     size_t got = 0;
     if (f) {
         got = fread(&g_b, 1, sizeof(g_b), f);
         fclose(f);
     }
+    u_sd_unlock();
     bool valid = got >= BAT_FILE_V1_SIZE && g_b.magic == BAT_MAGIC &&
                  g_b.hi_mv > g_b.lo_mv && g_b.hi_mv <= 5000 && g_b.lo_mv >= 2000;
     if (!valid) {
@@ -177,6 +182,7 @@ static void load(void)
     g_med_n = 0;
     g_med_i = 0;
     g_blog_n = 0;
+    g_pct_cache = -1;
 }
 
 void batt_init(void) { load(); }
@@ -184,27 +190,6 @@ void batt_init(void) { load(); }
 int batt_sample_count(void) { return (int)(g_b.samples > INT32_MAX ? INT32_MAX : g_b.samples); }
 int batt_hi_mv(void) { return g_b.hi_mv; }
 int batt_lo_mv(void) { return g_b.lo_mv; }
-
-void batt_reset(void)
-{
-    memset(&g_b, 0, sizeof(g_b));
-    g_b.magic = BAT_MAGIC;
-    g_b.hi_mv = BAT_NOMINAL_HI;
-    g_b.lo_mv = BAT_NOMINAL_LO;
-    g_b.last_pct = -1;
-    g_b.last_mv = -1;
-    g_dirty = true;
-    g_med_n = 0;
-    g_med_i = 0;
-    g_blog_n = 0;
-    g_last_charging = false;
-    g_first = true;
-    g_stable = 0;
-    g_last_mv = -1;
-    g_soc = -1;
-    g_full = false;
-    g_low = false;
-}
 
 void batt_flush(void)
 {
@@ -218,12 +203,6 @@ static void ewm(int16_t* dst, int target, int a_x100)
 {
     int d = target - *dst;
     *dst = (int16_t)(*dst + (d * a_x100 + (d >= 0 ? 50 : -50)) / 100);
-}
-
-void batt_sample(int mv, bool charging, int temp_dc)
-{
-    /* Host/tests: without the CHG_STAT pin, low means charging. */
-    batt_sample_ex(mv, charging, !charging, temp_dc);
 }
 
 void batt_sample_ex(int mv, bool charging, bool chg_stat_high, int temp_dc)
@@ -301,6 +280,7 @@ void batt_sample_ex(int mv, bool charging, bool chg_stat_high, int temp_dc)
         g_median[g_med_i] = g_soc;
         g_med_i = (g_med_i + 1) % 11;
         if (g_med_n < 11) g_med_n++;
+        g_pct_cache = -1;
     }
 
     batt_log_t lg;
@@ -327,6 +307,7 @@ int batt_percent(void)
 {
     if (g_full) return 100;
     if (g_med_n == 0) return batt_percent_raw();
+    if (g_pct_cache >= 0) return g_pct_cache;
     int tmp[11];
     memcpy(tmp, g_median, (size_t)g_med_n * sizeof(int));
     for (int i = 1; i < g_med_n; i++) {
@@ -334,18 +315,11 @@ int batt_percent(void)
         while (j >= 0 && tmp[j] > v) { tmp[j + 1] = tmp[j]; j--; }
         tmp[j + 1] = v;
     }
-    return tmp[g_med_n / 2];
+    g_pct_cache = tmp[g_med_n / 2];
+    return g_pct_cache;
 }
 
 bool batt_is_full(void) { return g_full; }
 bool batt_is_low(void) { return g_low; }
 
-int batt_health(void)
-{
-    int span = (int)g_b.hi_mv - (int)g_b.lo_mv;
-    int nominal = BAT_NOMINAL_HI - BAT_NOMINAL_LO;
-    int h = span * 100 / nominal;
-    if (h < 0) h = 0;
-    if (h > 100) h = 100;
-    return h;
-}
+

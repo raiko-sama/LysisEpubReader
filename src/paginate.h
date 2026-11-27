@@ -23,4 +23,3 @@ typedef struct {
 Layout* pg_layout(const char* text, size_t len, int width, int height, int font, int gap);
 void    pg_free(Layout* l);
 int     pg_page_of_offset(const Layout* l, size_t off);
-void    pg_width_cache_reset(void);

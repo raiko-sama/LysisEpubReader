@@ -99,6 +99,20 @@ static const char* entity_lookup(const char* name, int len)
     return found ? (*found)->utf8 : NULL;
 }
 
+/* block-level tag names, sorted for bsearch (case-insensitive via a
+   lowercased lookup key) */
+typedef struct { const char* name; } block_tag_t;
+static const block_tag_t kBlockTags[] = {
+    {"article"},{"blockquote"},{"dd"},{"div"},{"dl"},{"dt"},
+    {"figcaption"},{"figure"},{"footer"},{"h1"},{"h2"},{"h3"},
+    {"h4"},{"h5"},{"h6"},{"header"},{"li"},{"nav"},{"ol"},{"p"},
+    {"pre"},{"section"},{"table"},{"td"},{"tr"},{"ul"}
+};
+static int cmp_block_tag(const void* a, const void* b)
+{
+    return strcmp((const char*)a, ((const block_tag_t*)b)->name);
+}
+
 typedef struct {
     char* buf;
     size_t cap, len;
@@ -162,6 +176,7 @@ static void ob_flush_space(outbuf_t* o, int* pending)
 static char fold_cp(uint32_t cp)
 {
     if (cp >= 0xC0 && cp <= 0xC5) return 'A';
+    if (cp == 0xC6) return 'A';
     if (cp == 0xC7) return 'C';
     if (cp >= 0xC8 && cp <= 0xCB) return 'E';
     if (cp >= 0xCC && cp <= 0xCF) return 'I';
@@ -171,6 +186,7 @@ static char fold_cp(uint32_t cp)
     if (cp >= 0xD9 && cp <= 0xDC) return 'U';
     if (cp == 0xDD) return 'Y';
     if (cp >= 0xE0 && cp <= 0xE5) return 'a';
+    if (cp == 0xE6) return 'a';
     if (cp == 0xE7) return 'c';
     if (cp >= 0xE8 && cp <= 0xEB) return 'e';
     if (cp >= 0xEC && cp <= 0xEF) return 'i';
@@ -184,6 +200,7 @@ static char fold_cp(uint32_t cp)
     if (cp == 0x2026) return '.';
     if (cp == 0x00A0) return ' ';
     if (cp == 0x00AB || cp == 0x00BB) return '"';
+    if (cp == 0x00DF) return 's';
     return '?';
 }
 
@@ -287,21 +304,21 @@ char* ht_to_text(const char* html, size_t len, size_t* out_len)
                 continue;
             }
 
-            static const struct { const char* name; int len; } block[] = {
-                {"p",1},{"div",3},{"h1",2},{"h2",2},{"h3",2},{"h4",2},{"h5",2},{"h6",2},
-                {"li",2},{"tr",2},{"table",5},{"section",7},{"article",7},{"blockquote",10},
-                {"pre",3},{"figcaption",10},{"figure",6},{"header",6},{"footer",6},{"nav",3},
-                {"ul",2},{"ol",2},{"dl",2},{"dt",2},{"dd",2},{"td",2}
-            };
-            for (size_t i = 0; i < sizeof(block) / sizeof(block[0]); i++) {
-                if (nlen == block[i].len && u_icmp(name, block[i].name, (size_t)block[i].len) == 0) {
+            {
+                char tagkey[16];
+                int klen = nlen < (int)sizeof(tagkey) - 1 ? nlen : (int)sizeof(tagkey) - 1;
+                for (int ki = 0; ki < klen; ki++)
+                    tagkey[ki] = (char)tolower((unsigned char)name[ki]);
+                tagkey[klen] = 0;
+                if (bsearch(tagkey, kBlockTags,
+                            sizeof(kBlockTags) / sizeof(kBlockTags[0]),
+                            sizeof(kBlockTags[0]), cmp_block_tag)) {
                     int blank = (!closing &&
                                  (TAG_IS(name, nlen, "p") || TAG_IS(name, nlen, "h1") || TAG_IS(name, nlen, "h2") ||
                                   TAG_IS(name, nlen, "h3") || TAG_IS(name, nlen, "div") || TAG_IS(name, nlen, "section") ||
                                   TAG_IS(name, nlen, "article") || TAG_IS(name, nlen, "blockquote") || TAG_IS(name, nlen, "li")));
                     ob_newline(&o, blank);
                     pending_space = 0;
-                    break;
                 }
             }
             p = close + 1;
@@ -329,31 +346,8 @@ char* ht_to_text(const char* html, size_t len, size_t* out_len)
                                 ob_flush_space(&o, &pending_space);
                                 ob_put_utf8(&o, (unsigned)cp);
                             } else {
-                            char rep = '?';
-                            if (cp >= 0xC0 && cp <= 0xC5) rep = 'A';
-                            else if (cp == 0xC7) rep = 'C';
-                            else if (cp >= 0xC8 && cp <= 0xCB) rep = 'E';
-                            else if (cp >= 0xCC && cp <= 0xCF) rep = 'I';
-                            else if (cp == 0xD1) rep = 'N';
-                            else if (cp >= 0xD2 && cp <= 0xD6) rep = 'O';
-                            else if (cp == 0xD8) rep = 'O';
-                            else if (cp >= 0xD9 && cp <= 0xDC) rep = 'U';
-                            else if (cp == 0xDD) rep = 'Y';
-                            else if (cp >= 0xE0 && cp <= 0xE5) rep = 'a';
-                            else if (cp == 0xE7) rep = 'c';
-                            else if (cp >= 0xE8 && cp <= 0xEB) rep = 'e';
-                            else if (cp >= 0xEC && cp <= 0xEF) rep = 'i';
-                            else if (cp == 0xF1) rep = 'n';
-                            else if (cp >= 0xF2 && cp <= 0xF6) rep = 'o';
-                            else if (cp == 0xF8) rep = 'o';
-                            else if (cp >= 0xF9 && cp <= 0xFC) rep = 'u';
-                            else if (cp == 0xFD || cp == 0xFF) rep = 'y';
-                            else if (cp == 0xA0) rep = ' ';
-                            else if (cp == 0xDF) rep = 's';
-                            else if (cp == 0xE6) rep = 'a';
-                            else if (cp == 0xC6) rep = 'A';
                             ob_flush_space(&o, &pending_space);
-                            ob_putc(&o, rep);
+                            ob_putc(&o, fold_cp((uint32_t)cp));
                             }
                         } else if (cp == 0x2018 || cp == 0x2019) { ob_flush_space(&o, &pending_space); ob_putc(&o, '\''); }
                         else if (cp == 0x201C || cp == 0x201D) { ob_flush_space(&o, &pending_space); ob_putc(&o, '"'); }

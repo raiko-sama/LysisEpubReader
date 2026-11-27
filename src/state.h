@@ -52,13 +52,6 @@ int  st_init(void);
 void st_save_cfg(void);
 void st_load_cfg(void);
 
-/* known WiFi networks (persisted credentials, most recent first) */
-#define WNET_MAX 4
-void st_wifi_save(const char* ssid, const char* pass);
-const char* st_wifi_find(const char* ssid);     /* returns password or NULL */
-int  st_wifi_count(void);
-int  st_wifi_get(int i, char* ssid, int sslen, char* pass, int palen);
-
 /* W1: cached BSSID/channel for fast (scan-less) reconnects */
 bool st_wifi_fast_get(const char* ssid, uint8_t bssid_out[6], int* channel_out);
 void st_wifi_fast_save(const char* ssid, const uint8_t bssid[6], int channel);
@@ -67,6 +60,3 @@ void st_book_path(const char* bookpath, char* out, int outlen);
 void st_book_path_legacy(const char* bookpath, char* out, int outlen);
 int  st_book_get(const char* bookpath, BookState* st);
 void st_book_put(const char* bookpath, const BookState* st);
-int  st_book_get_count(void);   /* instrumentation (I1 host test) */
-
-int  st_total_books_progress(void);   /* rough library progress, -1 unknown */

@@ -11,11 +11,7 @@
 #include <esp_sleep.h>
 #include <esp_system.h>
 #include <esp_timer.h>
-#include <esp_task_wdt.h>
 #include <esp32-hal-psram.h>
-#if defined(ESP32) && OPT_CRASH_GUARD
-#include <esp_core_dump.h>
-#endif
 
 #if DIAG_LOG
 #define BRD_DIAG(...) Serial.printf("[Lysis] diag: " __VA_ARGS__)
@@ -35,10 +31,8 @@
 // Canvas: draw to PSRAM sprite, push on refresh (e-paper friendly)
 // ------------------------------------------------------------------
 static M5Canvas g_canvas(&M5.Display);
-static M5Canvas* g_draw = &g_canvas;   /* current draw target (R1 slots) */
 static bool     g_canvasReady = false;
 static int      g_canvas_font_size = -1;
-static int      g_rot = 0;
 static void     wait_display_collect(void);
 static int      utf8_width(lgfx::LGFX_Sprite* c, const char* s);
 
@@ -73,15 +67,28 @@ static void recreate_canvas(void)
         g_dbg_canvas_w = (uint32_t)g_canvas.width();
         g_dbg_canvas_h = (uint32_t)g_canvas.height();
     }
-    g_draw = &g_canvas;
     if (!g_canvasReady) {
         Serial.println("BRD: canvas alloc failed");
     }
 }
 
-extern "C" void brd_wdt_feed(void) { esp_task_wdt_reset(); }
-
 extern "C" void brd_log(const char* s)
+{
+    /* Non-blocking: with no host draining the CDC ring, a blocking printf
+       can stall the UI task. Diagnostic lines are dropped when full;
+       protocol responses use brd_log_sync(). */
+    static const char prefix[] = "[Lysis] ";
+    int space = Serial.availableForWrite();
+    if (space < (int)sizeof(prefix)) return;
+    Serial.write((const uint8_t*)prefix, sizeof(prefix) - 1);
+    space -= (int)sizeof(prefix) - 1;
+    size_t n = strlen(s);
+    if (n > (size_t)(space - 1)) n = (size_t)(space - 1);
+    if (n) Serial.write((const uint8_t*)s, n);
+    if (space > (int)n) Serial.write((const uint8_t*)"\n", 1);
+}
+
+extern "C" void brd_log_sync(const char* s)
 {
     Serial.printf("[Lysis] %s\n", s);
 }
@@ -90,15 +97,10 @@ extern "C" int brd_serial_avail(void) { return Serial.available(); }
 extern "C" int brd_serial_read(void) { return Serial.read(); }
 extern "C" int brd_serial_write(const void* p, int n) { return (int)Serial.write((const uint8_t*)p, (size_t)n); }
 
-static uint64_t s_boot_us = 0;
-
 extern "C" void brd_serial_begin(void)
 {
     Serial.begin(115200);   /* USB CDC console (device bring-up logs) */
     delay(30);
-#ifndef APP_QEMU
-    if (!s_boot_us) s_boot_us = esp_timer_get_time();   /* power -> app marker */
-#endif
 }
 
 extern "C" uint64_t brd_us(void)
@@ -107,15 +109,6 @@ extern "C" uint64_t brd_us(void)
     return (uint64_t)millis() * 1000ULL;
 #else
     return esp_timer_get_time();
-#endif
-}
-
-extern "C" uint64_t brd_boot_us(void)
-{
-#ifdef APP_QEMU
-    return 0;
-#else
-    return s_boot_us;
 #endif
 }
 
@@ -149,16 +142,6 @@ extern "C" void brd_begin(bool minimal)
 #endif
 }
 
-extern "C" int brd_reset_reason(void)
-{
-#ifdef APP_QEMU
-    return 0;
-#else
-    return (int)esp_reset_reason();
-#endif
-}
-
-extern "C" uint16_t brd_color(uint8_t r, uint8_t g, uint8_t b) { return M5.Display.color565(r, g, b); }
 extern "C" int  brd_width(void)  { return M5.Display.width() ? M5.Display.width() : 960; }
 extern "C" int  brd_height(void) { return M5.Display.height() ? M5.Display.height() : 540; }
 extern "C" uint32_t brd_millis(void) { return millis(); }
@@ -170,20 +153,27 @@ extern "C" int brd_cpu_freq(int mhz)
     (void)mhz;
     return 240;
 #else
-    if (mhz == 40 || mhz == 80 || mhz == 160 || mhz == 240) {
-        if (!setCpuFrequencyMhz(mhz)) return getCpuFrequencyMhz();
+    /* Every caller runs in the UI task: a local shadow avoids the per-loop
+       setCpuFrequencyMhz call (the core would early-out, but the call and
+       the RTC config read are pure overhead). */
+    static int g_cpu_mhz = -1;
+    if (g_cpu_mhz == mhz) return g_cpu_mhz;
+    /* 40 MHz is not admissible: the system baseline is always 80 MHz.
+       Requests below the baseline are refused outright so no caller can
+       ever drop the CPU under 80 (UI/touch/EPD depend on it). */
+    if (mhz == 80 || mhz == 160 || mhz == 240) {
+        if (!setCpuFrequencyMhz(mhz)) { g_cpu_mhz = getCpuFrequencyMhz(); return g_cpu_mhz; }
     }
-    return getCpuFrequencyMhz();
+    g_cpu_mhz = getCpuFrequencyMhz();
+    return g_cpu_mhz;
 #endif
 }
 
 extern "C" void brd_rotation(int r)
 {
-    g_rot = r;
     M5.Display.setRotation((uint8_t)r);
     recreate_canvas();
 }
-extern "C" int brd_get_rotation(void) { return g_rot; }
 
 // ------------------------------------------------------------------
 // drawing
@@ -196,6 +186,7 @@ static void font_setup(lgfx::LGFX_Sprite* c, int size)
 {
     switch (size) {
         case 0:  c->setFont(&fonts::Font0); c->setTextSize(1.0f); break;
+        case 1:  c->setFont(&fonts::Font2); c->setTextSize(1.0f); break;
         case 2:  c->setFont(&fonts::Font4); c->setTextSize(1.0f); break;
         case 3:  c->setFont(&fonts::Font2); c->setTextSize(1.5f); break;   /* 24 px */
         case 4:  c->setFont(&fonts::Font4); c->setTextSize(1.5f); break;   /* 39 px */
@@ -225,39 +216,50 @@ static void font_setup_cached(lgfx::LGFX_Sprite* c, int size)
     font_setup(c, size);
 }
 
-#define BRD_WCACHE_N 48
+/* 2-way set-associative width cache: hash lookup instead of scanning 48
+   entries with strcmp on every brd_text_w() call. */
+#define BRD_WCACHE_SETS 32
+#define BRD_WCACHE_WAYS 2
+#define BRD_WCACHE_TEXT 80
 static struct {
-    bool used;
-    int font;
+    uint32_t key;
     int width;
-    char text[80];
-} g_wcache[BRD_WCACHE_N];
-static int g_wcache_next = 0;
+    char text[BRD_WCACHE_TEXT];
+} g_wcache[BRD_WCACHE_SETS][BRD_WCACHE_WAYS];
+static uint8_t g_wcache_victim[BRD_WCACHE_SETS];
 static bool g_font_h_valid[15];
 static int  g_font_h_cache[15];
+
+static uint32_t wcache_hash(const char* s, size_t n, int font)
+{
+    uint32_t h = 2166136261u ^ ((uint32_t)font * 16777619u);
+    for (size_t i = 0; i < n; i++) {
+        h ^= (unsigned char)s[i];
+        h *= 16777619u;
+    }
+    return h ? h : 1u;
+}
 
 static int cached_text_width(const char* s, int size)
 {
     size_t n = strlen(s);
-    if (n < sizeof(g_wcache[0].text)) {
-        for (int i = 0; i < BRD_WCACHE_N; i++) {
-            if (g_wcache[i].used && g_wcache[i].font == size &&
-                !strcmp(g_wcache[i].text, s))
-                return g_wcache[i].width;
-        }
+    if (n >= BRD_WCACHE_TEXT) return utf8_width(&g_canvas, s);
+    uint32_t key = wcache_hash(s, n, size);
+    int set = (int)(key & (BRD_WCACHE_SETS - 1));
+    for (int w = 0; w < BRD_WCACHE_WAYS; w++) {
+        if (g_wcache[set][w].key == key && !strcmp(g_wcache[set][w].text, s))
+            return g_wcache[set][w].width;
     }
-    int w = utf8_width(&g_canvas, s);
-    if (n < sizeof(g_wcache[0].text)) {
-        int slot = g_wcache_next++ % BRD_WCACHE_N;
-        g_wcache[slot].used = true;
-        g_wcache[slot].font = size;
-        g_wcache[slot].width = w;
-        memcpy(g_wcache[slot].text, s, n + 1);
-    }
-    return w;
+    int width = utf8_width(&g_canvas, s);
+    int victim = g_wcache_victim[set];
+    g_wcache_victim[set] = (uint8_t)((victim + 1) % BRD_WCACHE_WAYS);
+    g_wcache[set][victim].key = key;
+    g_wcache[set][victim].width = width;
+    memcpy(g_wcache[set][victim].text, s, n + 1);
+    return width;
 }
 
-extern "C" void brd_clear(uint16_t c) { if (g_canvasReady) g_draw->fillScreen(c); }
+extern "C" void brd_clear(uint16_t c) { if (g_canvasReady) g_canvas.fillScreen(c); }
 
 /* UTF-8 fallback for Latin-1 letters: the built-in RLE fonts are ASCII-only.
    Draw the base glyph and a small diacritic so Italian text (ArtÃ¹, Ã¨, ...)
@@ -302,8 +304,16 @@ static uint32_t utf8_next(const unsigned char*& p)
 
 static const UtfAccent* accent_for(uint32_t code)
 {
-    for (size_t i = 0; i < sizeof(kAccents)/sizeof(kAccents[0]); i++)
-        if (kAccents[i].code == code) return &kAccents[i];
+    /* kAccents is sorted by code: binary search (O(log n) vs ~28 compares
+       on average per accented glyph). */
+    int lo = 0, hi = (int)(sizeof(kAccents) / sizeof(kAccents[0])) - 1;
+    while (lo <= hi) {
+        int mid = (lo + hi) >> 1;
+        uint32_t mc = kAccents[mid].code;
+        if (mc == code) return &kAccents[mid];
+        if (mc < code) lo = mid + 1;
+        else hi = mid - 1;
+    }
     return nullptr;
 }
 
@@ -344,7 +354,28 @@ static int draw_utf8(lgfx::LGFX_Sprite* c, int x, int y, const char* s, uint16_t
 {
     int start = x;
     const unsigned char* p = (const unsigned char*)s;
+    char run[64];
+    int rn = 0;
+
+    /* Batch consecutive printable-ASCII glyphs into one drawString: same
+       font, same coordinates, identical pixels, far fewer calls. */
+    auto flush_run = [&]() {
+        if (!rn) return;
+        run[rn] = 0;
+        c->drawString(run, x, y);
+        x += c->textWidth(run);
+        rn = 0;
+    };
+
     while (*p) {
+        unsigned char c0 = *p;
+        if (c0 >= 0x20 && c0 < 0x7F) {
+            if (rn >= (int)sizeof(run) - 1) flush_run();
+            run[rn++] = (char)c0;
+            p++;
+            continue;
+        }
+        flush_run();
         uint32_t code = utf8_next(p);
         char base[2] = {0, 0};
         const UtfAccent* a = accent_for(code);
@@ -373,6 +404,7 @@ static int draw_utf8(lgfx::LGFX_Sprite* c, int x, int y, const char* s, uint16_t
         if (a) draw_accent(c, x, y, fw, c->fontHeight(), a->kind, fg);
         x += fw;
     }
+    flush_run();
     return x - start;
 }
 
@@ -397,22 +429,17 @@ static int utf8_width(lgfx::LGFX_Sprite* c, const char* s)
     return w;
 }
 
-static int g_odx = 0, g_ody = 0;
-static bool g_anim = false;
-extern "C" void brd_draw_offset(int dx, int dy) { g_odx = dx; g_ody = dy; }
-extern "C" void brd_anim(bool on) { g_anim = on; }
-
-extern "C" void brd_fill_rect(int x, int y, int w, int h, uint16_t c) { if (g_canvasReady) g_draw->fillRect(x + g_odx, y + g_ody, w, h, c); }
-extern "C" void brd_draw_rect(int x, int y, int w, int h, uint16_t c) { if (g_canvasReady) g_draw->drawRect(x + g_odx, y + g_ody, w, h, c); }
-extern "C" void brd_hline(int x, int y, int w, uint16_t c) { if (g_canvasReady) g_draw->drawFastHLine(x + g_odx, y + g_ody, w, c); }
-extern "C" void brd_line(int x0, int y0, int x1, int y1, uint16_t c) { if (g_canvasReady) g_draw->drawLine(x0 + g_odx, y0 + g_ody, x1 + g_odx, y1 + g_ody, c); }
+extern "C" void brd_fill_rect(int x, int y, int w, int h, uint16_t c) { if (g_canvasReady) g_canvas.fillRect(x, y, w, h, c); }
+extern "C" void brd_draw_rect(int x, int y, int w, int h, uint16_t c) { if (g_canvasReady) g_canvas.drawRect(x, y, w, h, c); }
+extern "C" void brd_hline(int x, int y, int w, uint16_t c) { if (g_canvasReady) g_canvas.drawFastHLine(x, y, w, c); }
+extern "C" void brd_line(int x0, int y0, int x1, int y1, uint16_t c) { if (g_canvasReady) g_canvas.drawLine(x0, y0, x1, y1, c); }
 
 extern "C" void brd_text(int x, int y, const char* s, uint16_t fg, int size)
 {
     if (!g_canvasReady) return;
-    font_setup_cached(g_draw, size);
-    g_draw->setTextColor(fg);
-    draw_utf8(g_draw, x + g_odx, y + g_ody, s, fg);
+    font_setup_cached(&g_canvas, size);
+    g_canvas.setTextColor(fg);
+    draw_utf8(&g_canvas, x, y, s, fg);
 }
 
 extern "C" int brd_text_w(const char* s, int size)
@@ -469,9 +496,9 @@ extern "C" int brd_text_fit(char* out, int outlen, const char* s, int maxw, int 
 #else
     if (!g_canvasReady) return n;
     font_setup_cached(&g_canvas, size);
-    if (utf8_width(&g_canvas, out) <= maxw) return n;
-    /* estimate a cut point by width ratio, then trim precisely */
     int wout = utf8_width(&g_canvas, out);
+    if (wout <= maxw) return n;
+    /* estimate a cut point by width ratio, then trim precisely */
     int est = wout > 0 ? (int)((int64_t)n * maxw / wout) : n;
     if (est < 1) est = 1;
     if (est > n - 1) est = n - 1;
@@ -496,21 +523,7 @@ extern "C" int brd_text_fit(char* out, int outlen, const char* s, int maxw, int 
 
 extern "C" void brd_draw_rgb565(int x, int y, int w, int h, const uint16_t* px)
 {
-    if (g_canvasReady) g_draw->pushImage(x + g_odx, y + g_ody, w, h, px);
-}
-
-extern "C" int brd_draw_jpeg(const uint8_t* p, size_t n, int x, int y, int maxw, int maxh)
-{
-    if (!g_canvasReady) return 0;
-    return g_draw->drawJpg(p, (uint32_t)n, x + g_odx, y + g_ody, maxw, maxh,
-                           0, 0, 1.0f, 0.0f, datum_t::top_left);
-}
-
-extern "C" int brd_draw_png(const uint8_t* p, size_t n, int x, int y, int maxw, int maxh)
-{
-    if (!g_canvasReady) return 0;
-    return g_draw->drawPng(p, (uint32_t)n, x + g_odx, y + g_ody, maxw, maxh,
-                           0, 0, 1.0f, 0.0f, datum_t::top_left);
+    if (g_canvasReady) g_canvas.pushImage(x, y, w, h, px);
 }
 
 /* minimal header parsers for the target size of a decoded image */
@@ -563,26 +576,24 @@ extern "C" uint16_t* brd_img_decode(const uint8_t* p, size_t n, int maxw, int ma
     if (tw < 1) tw = 1;
     if (th < 1) th = 1;
 
+    /* Decode straight into the caller-owned buffer: setBuffer() wraps it and
+       deleteSprite() releases the wrapper without freeing it (Preallocated). */
+    size_t sz = (size_t)tw * (size_t)th * sizeof(uint16_t);
+    uint16_t* out = (uint16_t*)ps_malloc(sz);
+    if (!out) out = (uint16_t*)malloc(sz);
+    if (!out) return nullptr;
     static M5Canvas g_dec(&M5.Display);
-    g_dec.setPsram(true);
-    g_dec.setColorDepth(16);
-    if (!g_dec.createSprite(tw, th)) return nullptr;
+    g_dec.setBuffer(out, tw, th, 16);
     g_dec.fillSprite(bg);
     float zx = (float)tw / (float)iw;
     float zy = (float)th / (float)ih;
     bool ok = is_jpg
                 ? g_dec.drawJpg(p, (uint32_t)n, 0, 0, tw, th, 0, 0, zx, zy, datum_t::top_left)
                 : g_dec.drawPng(p, (uint32_t)n, 0, 0, tw, th, 0, 0, zx, zy, datum_t::top_left);
-    if (!ok) { g_dec.deleteSprite(); return nullptr; }
-    size_t sz = (size_t)tw * (size_t)th * sizeof(uint16_t);
-    uint16_t* out = (uint16_t*)ps_malloc(sz);
-    if (!out) out = (uint16_t*)malloc(sz);
-    if (out) {
-        memcpy(out, g_dec.getBuffer(), sz);
-        *out_w = tw;
-        *out_h = th;
-    }
     g_dec.deleteSprite();
+    if (!ok) { free(out); return nullptr; }
+    *out_w = tw;
+    *out_h = th;
     return out;
 #endif
 }
@@ -623,9 +634,9 @@ extern "C" void brd_refresh(int mode)
 #else
     if (!g_canvasReady) return;
     switch (mode) {
-        case 1:  M5.Display.setEpdMode(g_anim ? epd_mode_t::epd_fastest : epd_mode_t::epd_text);   break;
+        case 1:  M5.Display.setEpdMode(epd_mode_t::epd_text);   break;
         case 2:  M5.Display.setEpdMode(epd_mode_t::epd_fast);   break;
-        default: M5.Display.setEpdMode(g_anim ? epd_mode_t::epd_fastest : epd_mode_t::epd_quality); break;
+        default: M5.Display.setEpdMode(epd_mode_t::epd_quality); break;
     }
     uint32_t t0 = millis();
     uint32_t p0 = (uint32_t)esp_timer_get_time();
@@ -660,9 +671,9 @@ extern "C" void brd_refresh_region(int x, int y, int w, int h, int mode)
     u_clip_rect(&x, &y, &w, &h, cw, chh);
     if (w <= 0 || h <= 0) return;
     switch (mode) {
-        case 1:  M5.Display.setEpdMode(g_anim ? epd_mode_t::epd_fastest : epd_mode_t::epd_text);   break;
+        case 1:  M5.Display.setEpdMode(epd_mode_t::epd_text);   break;
         case 2:  M5.Display.setEpdMode(epd_mode_t::epd_fast);   break;
-        default: M5.Display.setEpdMode(g_anim ? epd_mode_t::epd_fastest : epd_mode_t::epd_quality); break;
+        default: M5.Display.setEpdMode(epd_mode_t::epd_quality); break;
     }
     uint16_t* px = (uint16_t*)g_canvas.getBuffer();
     if (!px) { brd_refresh(mode); return; }
@@ -706,69 +717,12 @@ extern "C" void brd_refresh_region(int x, int y, int w, int h, int mode)
 #endif
 }
 
-extern "C" void brd_set_sleeping(bool s)
-{
-#ifdef APP_QEMU
-    (void)s;
-#else
-    if (s) M5.Display.sleep();
-    else   M5.Display.wakeup();
-#endif
-}
-
 extern "C" uint16_t* brd_canvas_ptr(void)
 {
 #ifdef APP_QEMU
     return nullptr;
 #else
     return (uint16_t*)g_canvas.getBuffer();
-#endif
-}
-
-/* ---- off-screen page canvases (R1 pre-render) ---- */
-extern "C" void* brd_canvas_alloc(int w, int h)
-{
-#ifdef APP_QEMU
-    (void)w; (void)h;
-    return nullptr;
-#else
-    M5Canvas* c = new M5Canvas(&M5.Display);
-    c->setPsram(true);
-    c->setColorDepth(16);
-    if (!c->createSprite(w, h)) { delete c; return nullptr; }
-    return c;
-#endif
-}
-
-extern "C" void brd_canvas_free(void* cv)
-{
-#ifdef APP_QEMU
-    (void)cv;
-#else
-    if (!cv) return;
-    M5Canvas* c = (M5Canvas*)cv;
-    if (g_draw == c) g_draw = &g_canvas;
-    delete c;
-#endif
-}
-
-extern "C" void brd_canvas_target(void* cv)
-{
-#ifdef APP_QEMU
-    (void)cv;
-#else
-    g_draw = cv ? (M5Canvas*)cv : &g_canvas;
-#endif
-}
-
-extern "C" void brd_canvas_blit(void* cv, int x, int y)
-{
-#ifdef APP_QEMU
-    (void)cv; (void)x; (void)y;
-#else
-    if (!cv || !g_canvasReady) return;
-    M5Canvas* c = (M5Canvas*)cv;
-    g_canvas.pushImage(x, y, c->width(), c->height(), (const uint16_t*)c->getBuffer());
 #endif
 }
 
@@ -900,22 +854,29 @@ extern "C" void brd_touch_poll(brd_touch_t* t)
 #endif
 }
 
-extern "C" bool brd_pwr_clicked(void) {
+extern "C" bool brd_pwr_clicked(void)
+{
 #ifdef APP_QEMU
     return false;
 #else
-    M5.update();
-    return M5.BtnPWR.wasClicked();
+    /* M5.update() also polls the GT911 over I2C on every call. The power key
+       is a latched PMIC register (AXP2101 0x49, cleared on read): poll that
+       at 10 Hz and feed BtnPWR directly, leaving the touch bus quiet. */
+    static uint32_t g_last_pwr_poll = 0;
+    uint32_t now = millis();
+    if ((uint32_t)(now - g_last_pwr_poll) >= 100u) {
+        g_last_pwr_poll = now;
+        uint8_t ks = M5.Power.getKeyState();
+        m5::Button_Class::button_state_t st = m5::Button_Class::state_nochange;
+        if (ks == 2) st = m5::Button_Class::state_clicked;
+        else if (ks != 0) st = m5::Button_Class::state_hold;
+        M5.BtnPWR.setState(now, st);
+    }
+    if (!M5.BtnPWR.wasClicked()) return false;
+    M5.BtnPWR.setState(now, m5::Button_Class::state_nochange);
+    return true;
 #endif
 }
-extern "C" bool brd_btn_clicked(void) {
-#ifdef APP_QEMU
-    return false;
-#else
-    return M5.BtnA.wasClicked();
-#endif
-}
-
 // ------------------------------------------------------------------
 // power & sensors
 // ------------------------------------------------------------------
@@ -952,9 +913,18 @@ extern "C" bool brd_vbus_present(void)
 #ifdef APP_QEMU
     return false;
 #else
-    static bool ready = false;
-    if (!ready) { pinMode(5, INPUT); ready = true; }
-    return digitalRead(5) != 0;
+    /* GPIO5 is not a reliable VBUS indicator for the native USB port on this
+       board. Use the host CDC connection state plus the PMIC VBUS reading
+       (cached: it is an I2C transaction, polled at most once per second). */
+    if (Serial) return true;
+    static uint32_t last = 0;
+    static bool present = false;
+    uint32_t now = millis();
+    if (last == 0 || (uint32_t)(now - last) >= 1000u) {
+        last = now;
+        present = M5.Power.getVBUSVoltage() > 4000;
+    }
+    return present;
 #endif
 }
 
@@ -982,14 +952,6 @@ extern "C" float brd_temp(void)
 #endif
 }
 
-extern "C" void brd_accel(float* x, float* y, float* z)
-{
-    *x = *y = *z = 0;
-#ifndef APP_QEMU
-    if (M5.Imu.isEnabled()) M5.Imu.getAccel(x, y, z);
-#endif
-}
-
 extern "C" void brd_imu_power(bool on)
 {
 #ifndef APP_QEMU
@@ -999,15 +961,6 @@ extern "C" void brd_imu_power(bool on)
     } else {
         if (M5.Imu.isEnabled()) M5.Imu.sleep();   /* saves current */
     }
-#endif
-}
-
-extern "C" bool brd_imu_enabled(void)
-{
-#ifdef APP_QEMU
-    return true;
-#else
-    return M5.Imu.isEnabled();
 #endif
 }
 
@@ -1032,66 +985,10 @@ extern "C" void brd_beep_stop(void) {
 #endif
 }
 
-extern "C" uint32_t brd_sleep_cause(void)
-{
-    esp_sleep_wakeup_cause_t c = esp_sleep_get_wakeup_cause();
-    switch (c) {
-        case ESP_SLEEP_WAKEUP_TIMER:  return 1;
-        case ESP_SLEEP_WAKEUP_EXT0:
-        case ESP_SLEEP_WAKEUP_EXT1:
-        case ESP_SLEEP_WAKEUP_GPIO:   return 2;
-        default: return 0;
-    }
-}
-
-extern "C" void brd_wait_button_release(void)
-{
-    while (M5.BtnPWR.isPressed()) delay(10);
-}
-
 extern "C" void brd_restart(void)
 {
     delay(100);
     esp_restart();
-}
-
-/* B2: copy a flash coredump (if any) to the SD and erase it from flash */
-extern "C" bool brd_coredump_save(const char* path)
-{
-#ifdef APP_QEMU
-    (void)path;
-    return false;
-#else
-#if OPT_CRASH_GUARD
-    size_t addr = 0, size = 0;
-    esp_core_dump_image_get(&addr, &size);
-    if (!addr || !size || size > (1u << 20)) return false;   /* sanity */
-    FILE* f = fopen(path, "wb");
-    if (!f) return false;
-    /* the dump lives in FLASH: esp_core_dump_image_get returns a flash
-       address, not RAM - read it back in chunks and stream it to the SD */
-    uint8_t* chunk = (uint8_t*)malloc(4096);
-    bool ok = (chunk != NULL);
-    if (ok) {
-        for (size_t off = 0; off < size; off += 4096) {
-            size_t n = (size - off < 4096) ? (size - off) : 4096;
-            if (esp_flash_read(NULL, chunk, (uint32_t)(addr + off), (uint32_t)n) != ESP_OK ||
-                fwrite(chunk, 1, n, f) != n) {
-                ok = false;
-                break;
-            }
-        }
-        free(chunk);
-    }
-    fclose(f);
-    if (!ok) { remove(path); return false; }
-    esp_core_dump_image_erase();
-    return true;
-#else
-    (void)path;
-    return false;
-#endif
-#endif
 }
 
 extern "C" void brd_poweroff(void)
@@ -1155,6 +1052,22 @@ extern "C" void brd_deep_sleep(uint64_t us, bool touch_wakeup)
 
 static bool usb_msc_active(void);
 
+static uint32_t g_ls_entries = 0;
+static uint32_t g_ls_timer = 0;
+static uint32_t g_ls_touch = 0;
+static uint32_t g_ls_other = 0;
+static uint32_t g_ls_skipped = 0;
+
+extern "C" void brd_idle_stats(brd_ls_stats_t* out)
+{
+    if (!out) return;
+    out->entries = g_ls_entries;
+    out->timer = g_ls_timer;
+    out->touch = g_ls_touch;
+    out->other = g_ls_other;
+    out->skipped = g_ls_skipped;
+}
+
 extern "C" brd_ls_t brd_idle_sleep(uint32_t max_ms)
 {
 #ifdef APP_QEMU
@@ -1166,6 +1079,10 @@ extern "C" brd_ls_t brd_idle_sleep(uint32_t max_ms)
     return BRD_LS_SKIPPED;
 #else
     if (max_ms < LS_MIN_MS) { delay(max_ms); return BRD_LS_SKIPPED; }
+    /* E1 guard: the native USB Serial/JTAG peripheral does not survive light
+       sleep. With VBUS present (dev cable or charger) stay awake; E1 runs on
+       battery only. */
+    if (brd_vbus_present()) { g_ls_skipped++; delay(max_ms); return BRD_LS_SKIPPED; }
     if (brd_wifi_active() || brd_bt_active()) { delay(max_ms); return BRD_LS_SKIPPED; }
     if (usb_msc_active()) { delay(max_ms); return BRD_LS_SKIPPED; }   /* USB host owns the bus */
     if (M5.Display.displayBusy()) M5.Display.waitDisplay();    /* never during an EPD refresh */
@@ -1174,42 +1091,15 @@ extern "C" brd_ls_t brd_idle_sleep(uint32_t max_ms)
     esp_sleep_enable_gpio_wakeup();
     esp_sleep_enable_timer_wakeup((uint64_t)max_ms * 1000ULL);
     Serial.flush();
+    g_ls_entries++;
     esp_light_sleep_start();
     gpio_wakeup_disable(GPIO_NUM_48);
     switch (esp_sleep_get_wakeup_cause()) {
-        case ESP_SLEEP_WAKEUP_TIMER: return BRD_LS_TIMER;
-        case ESP_SLEEP_WAKEUP_GPIO:  return BRD_LS_TOUCH;
-        default:                     return BRD_LS_OTHER;
+        case ESP_SLEEP_WAKEUP_TIMER: g_ls_timer++; return BRD_LS_TIMER;
+        case ESP_SLEEP_WAKEUP_GPIO:  g_ls_touch++; return BRD_LS_TOUCH;
+        default:                     g_ls_other++; return BRD_LS_OTHER;
     }
 #endif
-#endif
-}
-
-/* ---- memory telemetry (Q2) ---- */
-extern "C" uint32_t brd_heap_free(void)
-{
-#ifdef APP_QEMU
-    return 200000;
-#else
-    return (uint32_t)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-#endif
-}
-
-extern "C" uint32_t brd_psram_free(void)
-{
-#ifdef APP_QEMU
-    return 8u * 1024u * 1024u;
-#else
-    return (uint32_t)heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
-#endif
-}
-
-extern "C" uint32_t brd_psram_largest(void)
-{
-#ifdef APP_QEMU
-    return 8u * 1024u * 1024u;
-#else
-    return (uint32_t)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
 #endif
 }
 
@@ -1225,9 +1115,6 @@ extern "C" void brd_apply_tz(int utc_hours)
     setenv("TZ", tz, 1);
     tzset();
 }
-
-static brd_wifi_progress_fn g_wifi_cb = nullptr;
-extern "C" void brd_wifi_progress_cb(brd_wifi_progress_fn cb) { g_wifi_cb = cb; }
 
 extern "C" int brd_wifi_sync(const char* ssid, const char* pass, int utc_hours, int timeout_s,
                              const uint8_t* bssid, int channel)
@@ -1255,56 +1142,23 @@ extern "C" int brd_wifi_sync(const char* ssid, const char* pass, int utc_hours, 
     uint32_t t0 = millis();
     uint32_t win = (uint32_t)timeout_s * 1000UL;
     while (WiFi.status() != WL_CONNECTED) {
-        if (win && g_wifi_cb) {
-            int pct = (int)((millis() - t0) * 60UL / win);
-            if (pct > 59) pct = 59;
-            g_wifi_cb(pct);
-        }
         if (millis() - t0 > win) {
             WiFi.disconnect(true);
-            if (g_wifi_cb) g_wifi_cb(0);
             BRD_DIAG("wifi fail (connect timeout)\n");
             return 1;
         }
         delay(100);
     }
     BRD_DIAG("wifi connected ssid='%s' rssi=%d\n", ssid ? ssid : "", (int)WiFi.RSSI());
-    if (g_wifi_cb) g_wifi_cb(60);
     configTime(utc_hours * 3600, 0, "pool.ntp.org", "time.nist.gov");
     t0 = millis();
     struct tm ti;
     while (!getLocalTime(&ti, 0)) {
-        if (g_wifi_cb) {
-            int pct = 60 + (int)((millis() - t0) * 39UL / 20000UL);
-            if (pct > 99) pct = 99;
-            g_wifi_cb(pct);
-        }
-        if (millis() - t0 > 20000UL) { if (g_wifi_cb) g_wifi_cb(0); BRD_DIAG("wifi fail (ntp timeout)\n"); return 2; }
+        if (millis() - t0 > 20000UL) { BRD_DIAG("wifi fail (ntp timeout)\n"); return 2; }
         delay(100);
     }
     BRD_DIAG("wifi ntp ok\n");
-    if (g_wifi_cb) g_wifi_cb(100);
     return 0;
-#endif
-}
-
-extern "C" int brd_wifi_scan(char (*ssids)[33], int max)
-{
-#ifdef APP_QEMU
-    (void)ssids; (void)max;
-    return 0;
-#else
-    WiFi.persistent(false);
-    WiFi.mode(WIFI_STA);
-    int n = WiFi.scanNetworks();
-    if (n < 0) n = 0;
-    BRD_DIAG("wifi scan n=%d\n", n);
-    if (n > max) n = max;
-    for (int i = 0; i < n; i++) {
-        snprintf(ssids[i], 33, "%s", WiFi.SSID(i).c_str());
-    }
-    WiFi.scanDelete();
-    return n;
 #endif
 }
 
@@ -1370,8 +1224,6 @@ extern "C" void brd_bt_off(void)
     }
 #endif
 }
-
-extern "C" bool brd_time_valid(void) { return time(nullptr) > 1700000000; }
 
 extern "C" bool brd_get_localtime(int* y, int* mo, int* d, int* h, int* mi, int* s)
 {
@@ -1473,16 +1325,6 @@ extern "C" uint64_t brd_sd_size(void) {
     return g_sd_ok ? (uint64_t)SD.cardSize() : 0;
 #endif
 }
-extern "C" uint64_t brd_sd_free(void)
-{
-#ifdef APP_QEMU
-    return 4ULL * 1024 * 1024 * 1024;
-#else
-    if (!g_sd_ok) return 0;
-    return (uint64_t)SD.totalBytes() - (uint64_t)SD.usedBytes();
-#endif
-}
-
 // ------------------------------------------------------------------
 // USB mass storage
 // ------------------------------------------------------------------

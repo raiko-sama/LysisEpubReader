@@ -33,5 +33,8 @@ void setup()
 
 void loop()
 {
-    delay(1000);   /* idle: the real loop runs on the app task */
+    /* the real loop runs on the app task: suspend the Arduino loop task
+       instead of waking it once per second */
+    vTaskSuspend(NULL);
+    for (;;) {}
 }

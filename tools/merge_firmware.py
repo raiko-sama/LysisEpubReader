@@ -16,7 +16,12 @@ def merge_firmware(source, target, env):
         framework_dir = env.PioPlatform().get_package_dir("framework-arduinoespressif32")
     except Exception:
         pass
-    out = os.path.join(project_dir, "lysis-reader-%s.bin" % env["PIOENV"])
+    if env["PIOENV"] == "release":
+        out = os.path.join(project_dir, "lysis-reader-1.0.2.bin")
+    elif env["PIOENV"] == "m5stack-papers3":
+        out = os.path.join(project_dir, "lysis-reader-1.0.2-dev.bin")
+    else:
+        out = os.path.join(project_dir, "lysis-reader-%s.bin" % env["PIOENV"])
     esptool = os.path.join(core_dir, "packages", "tool-esptoolpy", "esptool.py")
     firmware = os.path.join(build_dir, "firmware.bin")
     partitions = os.path.join(build_dir, "partitions.bin")

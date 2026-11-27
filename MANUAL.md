@@ -1,6 +1,6 @@
 # Build and Flash Manual
 
-Step-by-step guide for **Lysis Epub Reader V1.01 Beta** on the M5Stack Paper S3.
+Step-by-step guide for **Lysis Epub Reader V1.0.2** on the M5Stack Paper S3.
 
 ## 1. Requirements
 
@@ -43,22 +43,30 @@ The firmware creates `.state/` automatically for settings, reading state, bookma
 
 ## 4. Build the firmware
 
-From the repository root:
+Distribution build (recommended; no serial test CLI):
+
+```bash
+pio run -e release
+```
+
+Development build with the serial test CLI:
 
 ```bash
 pio run -e m5stack-papers3
 ```
 
-Main outputs:
+Main outputs for the release build:
 
-- `.pio/build/m5stack-papers3/firmware.bin` — application image
-- `lysis-reader-m5stack-papers3.bin` — merged 8 MB image for a complete flash
+- `.pio/build/release/firmware.bin` — application image
+- `lysis-reader-1.0.2.bin` — merged 8 MB image for a complete flash
+
+The development environment produces `.pio/build/m5stack-papers3/firmware.bin` and `lysis-reader-1.0.2-dev.bin`.
 
 Clean build:
 
 ```bash
-pio run -e m5stack-papers3 -t clean
-pio run -e m5stack-papers3
+pio run -e release -t clean
+pio run -e release
 ```
 
 ## 5. Connect the board
@@ -75,7 +83,7 @@ pio run -e m5stack-papers3
 Replace `COM3` with your port:
 
 ```bash
-pio run -e m5stack-papers3 -t upload --upload-port COM3
+pio run -e release -t upload --upload-port COM3
 ```
 
 Wait for the success message and the automatic restart.
@@ -93,14 +101,20 @@ Press `Ctrl+C`, then retry the upload.
 The merged image contains the bootloader, partition table and application:
 
 ```bash
-esptool.py --chip esp32s3 -p COM3 -b 921600 write_flash 0x0 firmware/lysis-reader-m5stack-papers3.bin
+esptool.py --chip esp32s3 -p COM3 -b 921600 write_flash 0x0 firmware/lysis-reader-1.0.2.bin
 ```
 
 Use this for a complete recovery or a first installation from a blank device. It replaces the full flash content.
 
+If the device stays in download mode after a merged flash, erase the otadata region and reboot:
+
+```bash
+esptool.py --chip esp32s3 -p COM3 erase_region 0xe000 0x2000
+```
+
 ## 8. First boot
 
-The device shows the boot screen and then opens the library.
+The device shows the boot screen with the firmware version at the bottom centre, then opens the library.
 
 - Tap a book to open it.
 - Tap the left or right page edge to turn pages.
@@ -108,9 +122,18 @@ The device shows the boot screen and then opens the library.
 - Swipe down to return to the library.
 - Tap the status bar for chapter/bookmark controls or Go To page.
 
-## 9. Reading and search
+## 9. Reading and the rolling window
+
+The reader keeps up to four chapters (text + layout) ready around the current page.
+
+- Chapters at the boundary are switched from cache, without an "Opening chapter" screen during normal reading.
+- If a neighbour is still cold, the page turn stays pending and is completed by the background worker.
+- Eight pages per side are kept in normal reading; the window extends to twelve pages in the direction of a fast flip.
+- After six consecutive flips in the same direction the CPU rises to 240 MHz; after three seconds without input it returns to 80 MHz and the window becomes symmetric again.
 
 The reader stores the current chapter, page, bookmarks and layout settings.
+
+## 10. Search
 
 Search is **whole-word**:
 
@@ -118,9 +141,9 @@ Search is **whole-word**:
 - matching text is opened directly from the result list;
 - **Back** returns to the page where the search was started.
 
-Search uses a bounded chapter-text cache, so repeating the same search is faster.
+Search runs on the core-0 I/O worker and uses a bounded chapter-text cache, so the UI stays responsive and repeating the same search is faster.
 
-## 10. Battery behavior
+## 11. Battery behavior
 
 The firmware estimates the remaining charge from a LiPo open-circuit-voltage curve and learned charge/discharge endpoints.
 
@@ -132,7 +155,7 @@ The firmware estimates the remaining charge from a LiPo open-circuit-voltage cur
 
 The battery is a 3.7 V / 1800 mAh single-cell LiPo charged by an LGS4056H.
 
-## 11. Power-off behavior
+## 12. Power-off behavior
 
 When powered off:
 
@@ -142,7 +165,7 @@ When powered off:
 
 No timer wake-up is enabled for the power-off fallback path.
 
-## 12. USB Disk Mode
+## 13. USB Disk Mode
 
 1. From the library, swipe up to open the menu.
 2. Select **USB disk**.
@@ -153,16 +176,27 @@ No timer wake-up is enabled for the power-off fallback path.
 
 Do not unplug the cable while files are being written.
 
-## 13. Updating
+## 14. Updating
 
 ```bash
 git pull
-pio run -e m5stack-papers3 -t upload --upload-port COM3
+pio run -e release -t upload --upload-port COM3
 ```
 
 For a full recovery, flash the updated merged image as described in section 7.
 
-## 14. Troubleshooting
+## 15. Host smoke test (optional)
+
+The repository includes a headless GUI emulator used for host-side checks:
+
+```bash
+pwsh host/build_host.ps1
+./host/host_gui.exe tests/host_smoke.txt
+```
+
+Expected output ends with `DONE frames=N` (the exact frame count depends on the test library).
+
+## 16. Troubleshooting
 
 ### Serial port not found
 
@@ -195,8 +229,8 @@ Close serial monitors, IDEs or other applications using the port, then retry.
 ### Build fails
 
 ```bash
-pio run -e m5stack-papers3 -t clean
-pio run -e m5stack-papers3
+pio run -e release -t clean
+pio run -e release
 ```
 
 Check that PlatformIO can download its dependencies.
@@ -205,12 +239,12 @@ Check that PlatformIO can download its dependencies.
 
 JPEG and PNG are supported. Some formats, such as animated GIF, may not be decoded. This is a decoder limitation, not a library error.
 
-## 15. Safety
+## 17. Safety
 
 - Do not remove the microSD during writes or updates.
 - Do not interrupt a merged-image flash.
 - Use firmware and libraries from this repository.
 
-## 16. License
+## 18. License
 
 MIT. See [LICENSE](LICENSE).
